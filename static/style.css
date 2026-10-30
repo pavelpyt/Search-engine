@@ -134,3 +134,18 @@ pre { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; 
   .top { padding: 10px 12px; } .sub, .logo { display: none; }
   .ask { flex-wrap: wrap; } .ask .code { flex: 1 1 100%; }
 }
+
+/* run status, evidence, validation */
+.runstatus { border-radius: 10px; padding: 8px 12px; margin-bottom: 10px; font-size: 13px; border: 1px solid var(--line); }
+.runstatus.COMPLETED { background: color-mix(in srgb, var(--ok) 12%, transparent); border-color: var(--ok); }
+.runstatus.PARTIAL, .runstatus.INSUFFICIENT_EVIDENCE { background: color-mix(in srgb, var(--warn) 12%, transparent); border-color: var(--warn); }
+.runstatus.FAILED { background: color-mix(in srgb, var(--err) 12%, transparent); border-color: var(--err); }
+.runstatus .reasons { margin: 4px 0 0; padding-left: 18px; font-size: 12px; }
+.evidence .facts { list-style: none; padding: 0; }
+.evidence .fact { margin: 8px 0; }
+.evidence .fact ul { margin: 4px 0 0; padding-left: 18px; font-size: 12px; }
+.vstat { font-size: 10.5px; font-weight: 700; border-radius: 4px; padding: 1px 6px; margin-right: 4px; color: #fff; background: var(--muted); }
+.vstat.SUPPORTED { background: var(--ok); } .vstat.PARTIALLY_SUPPORTED { background: var(--B); }
+.vstat.CONTRADICTED, .vstat.UNSUPPORTED { background: var(--err); }
+.drawer-body details { margin-bottom: 8px; }
+.drawer-body summary { cursor: pointer; }

@@ -74,7 +74,36 @@ Každý handoff má dvě kontroly:
 - **kontrolu přijímajícího agenta**: Analyst i Writer vracejí `handoff_check: {ok, missing}`.
 
 Když jedna z nich neprojde, orchestrátor vrátí práci předchozímu agentovi se seznamem, co chybí
-(`MAX_RETURNS`, výchozí 1×). V UI je to vidět jako ↩ a v logu.
+a s jeho předchozím výstupem (`MAX_RETURNS`, výchozí 1× na přechod). Každý pokus má jeden auditovatelný
+záznam `validation_result` (kontrakt v kódu + kontrola příjemcem + rozhodnutí `retry | continue |
+continue_partial | abort`), v UI v záložce **Validace**.
+
+### Konečné stavy běhu (nic se netváří jako hotové)
+
+| Stav | Kdy |
+|---|---|
+| `COMPLETED` | všechny handoffy prošly, Writer cituje jen fakta z ledgeru, kontrola výstupu prošla |
+| `PARTIAL` | po vyčerpání vrácení existuje podložená podmnožina; v UI jsou vypsané důvody |
+| `INSUFFICIENT_EVIDENCE` | žádné podložené zjištění/fakt: běh se zastaví, Writer se nevolá, odpověď poctivě řekne, co chybí |
+| `FAILED` | technická chyba (API, nedokončený tah, refusal); odlišené od nedostatku důkazů |
+
+`max_tokens`, `refusal`, neznámý `stop_reason` ani vyčerpané `max_turns` se nikdy neberou jako hotový
+výstup: agent dostane jeden opravný tah, jinak běh končí `FAILED`.
+
+### Evidence ledger (`app/evidence.py`)
+
+Tři úrovně, které se nemíchají: **kvalita zdroje** (prior ze skillu), **podpora tvrzení** (citát podporuje
+tvrzení) a **nezávislé potvrzení** (různé weby, různé znění, ne dvě kopie jedné tiskové zprávy).
+
+1. Researcher u každého zjištění (`f1…`) dodá doslovný citát; `fetch_page` drží text stažené stránky na serveru.
+2. Kód hledá citát v textu (`exact | normalized | not_found | not_in_fetched_part | not_fetched`).
+   `quote_verified` znamená jen „citát je v textu, který jsme stáhli“, ne že je pravdivý.
+3. Analyst vytvoří fakta (`F1…`) s `based_on` odkazy na zjištění a `verification_status`
+   (`SUPPORTED | PARTIALLY_SUPPORTED | CONTRADICTED | UNSUPPORTED | NOT_CHECKED`).
+4. Kód z toho sestaví ledger: bez ověřeného citátu jistota max. `low`, `high` jen s ověřeným citátem
+   a nezávislostí (nebo primárním zdrojem); nezávislost počítá kód z různých webů a různých citátů.
+5. Writer dostane jen podložená fakta, vrací `used_facts` a kód kontroluje, že každé `[n]` v odpovědi
+   patří k použitému faktu. V UI panel **Důkazy** ukazuje fakta, citáty a ✓/✗.
 
 ## Skills
 
@@ -98,12 +127,17 @@ Skript lze pustit i ručně: `python skills/source-evaluation/scripts/score_sour
 Klikni na kartu agenta. Inspektor ukazuje:
 
 - **System prompt**: role + připojené skills, přesně jak šly do API,
-- **Messages**: přesné pole `messages` včetně `tool_use`, `tool_result`, `server_tool_use` a `web_search_tool_result`,
+- **API volání**: každý POST zvlášť (Request N / Response N) se snímkem `messages` v okamžiku odeslání,
+  `stop_reason`, tokeny a délkou; zobrazená verze je redigovaná (bez `encrypted_content`),
+- **Finální konverzace**: pole `messages` po doběhnutí agenta,
+- **Validace**: záznamy o předáních, kde agent byl odesílatel nebo příjemce,
 - **Tools**: JSON definice nástrojů a každé volání se vstupem a výsledkem,
 - **Výstup** a **Handoff in**: co agent vrátil a co dostal, včetně výsledku kontraktu,
-- **Skill**: celý SKILL.md.
+- **Skill**: celý SKILL.md a skutečné vykonání (`skill_loaded` = načteno do promptu, `skill_result` =
+  kolikrát se zavolal `evaluate_source` a pokrytí zdrojů; nepokrytý zdroj je chyba kontraktu).
 
-Každý běh se loguje do `logs/<run_id>.jsonl` a stáhne se z UI („Stáhnout log“).
+Každý běh se loguje do `logs/<run_id>.jsonl` (retence `LOG_RETENTION_DAYS`, výchozí 7 dní) a trace je
+v UI ke stažení jen pro session, která běh spustila.
 
 ## Spuštění
 
@@ -114,7 +148,7 @@ cp .env.example .env            # bez ANTHROPIC_API_KEY běží mock režim
 set -a; . ./.env; set +a
 uvicorn app.main:app --reload --port 8000
 # http://localhost:8000
-pytest -q                       # 12 testů, běží offline
+pytest -q                       # 34 testů, běží offline (mock + scénáře T01–T18)
 ```
 
 Nasazení je v příloze na konci.
@@ -122,13 +156,29 @@ Nasazení je v příloze na konci.
 ## Bezpečnost a náklady
 
 - Klíč jen v prostředí (`.env` / `/etc/research-agents.env`), nikdy v repu.
-- Volitelný `ACCESS_CODE` pro veřejné demo, limit `RUNS_PER_HOUR` na IP, otázka max. 500 znaků.
-- `fetch_page` odmítá privátní a lokální adresy (kontroluje každé přesměrování), stahuje max. 2 MB a vrací max. 6000 znaků textu.
+- Přístupový kód jde jen v těle `POST /api/session` → `HttpOnly`, `SameSite=Lax` cookie (Secure na HTTPS).
+  Otázka jde v těle `POST /api/jobs`; URL streamu nese jen id jobu. Trace i události vidí jen session,
+  která běh spustila. API odpovědi mají `Cache-Control: no-store`.
+- Job běží dál i při odpojení prohlížeče; stream se obnoví a přehraje od `Last-Event-ID`.
+- Limit `RUNS_PER_HOUR` na IP (za proxy `TRUST_PROXY=1`), `MAX_CONCURRENT_RUNS`, otázka max. 500 znaků.
+- `fetch_page`: jen porty 80/443, každý hop přesměrování se znovu ověří, DNS se přeloží jednou a spojení
+  jde na **ověřenou IP** (Host hlavička + TLS SNI pro původní jméno), takže DNS rebinding nepomůže;
+  max. 2 MB, max. 6000 znaků textu. Obsah webu je označený jako nedůvěryhodný a prompty zakazují
+  plnit instrukce z něj (prompt injection).
 - Volání API: retry s backoffem na 429 / 529 / 5xx (respektuje `retry-after`), timeout 600 s na dlouhé tahy s vyhledáváním.
 - Když agent nevrátí platný JSON, dostane jeden opravný tah se zprávou o chybě; teprve pak běh skončí chybou.
 - Do prohlížeče a logu nejdou `encrypted_content` bloky z vyhledávání (v požadavku na API zůstávají beze změny).
 - Odhad ceny běhu (tokeny × ceník v `.env` + vyhledávání) je vidět u každého agenta i u odpovědi.
 - Rozpočet vyhledávání (`max_uses`) a model podle náročnosti drží cenu jednoduchých dotazů nízko.
+
+## Co je a není ověřené
+
+- 34 offline testů včetně scénářů z review (stavy, `max_tokens`, paralelní tool_use, citace vs. podpora,
+  nezávislost, SSRF a rebinding, session a replay, snímky requestů, nevykonaný skill).
+- Mock režim projde UI end-to-end (session → job → SSE → odpověď s důkazy).
+- **Živý běh proti Claude API:** _doplnit po nasazení (datum, dotaz, odkaz na redigovaný trace v `samples/`)._
+- Hranice: prior skóre zdroje je heuristika z URL; `quote_verified` neověřuje pravdivost; ochrana proti
+  prompt injection je instrukční, ne garantovaná.
 
 ## Jak jsem pracoval s AI
 

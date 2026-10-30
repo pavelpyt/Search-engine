@@ -11,6 +11,7 @@ import copy
 import json
 import os
 import random
+import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
@@ -23,6 +24,17 @@ MAX_RETRIES = int(os.getenv("API_MAX_RETRIES", "4"))
 
 Emit = Callable[[dict], Awaitable[None]]
 ClientTool = Callable[[dict], Awaitable[str]]
+
+
+COMPLETE_STOPS = {"end_turn", "stop_sequence"}
+
+
+class AgentIncompleteError(RuntimeError):
+    """An agent did not finish its turn (max_tokens, max_turns, refusal, unknown stop)."""
+
+    def __init__(self, agent: str, stop_reason: str | None, detail: str = ""):
+        self.agent, self.stop_reason = agent, stop_reason
+        super().__init__(f"{agent} did not complete (stop_reason={stop_reason}). {detail}".strip())
 
 
 @dataclass
@@ -142,7 +154,7 @@ async def run_agent(
     await emit({"type": "agent_request", "agent": agent, "model": model, "system": system,
                 "tools": tools, "messages": for_display(messages)})
 
-    async def on_retry(attempt, delay):
+    async def on_retry(attempt, delay):  # noqa: D401
         await emit({"type": "log", "level": "warn",
                     "msg": f"{agent}: API overloaded, retry {attempt}/{MAX_RETRIES} in {delay}s"})
 
@@ -152,7 +164,16 @@ async def run_agent(
                   "tools": tools or None, "max_tokens": max_tokens}
         if isinstance(client, MessagesClient):
             kwargs["on_retry"] = on_retry
+        call_id = f"{agent}-{turn}"
+        # Exact (redacted) snapshot of what this POST sends: never overwritten later.
+        await emit({"type": "api_request", "agent": agent, "call_id": call_id, "model": model,
+                    "max_tokens": max_tokens, "tools": [t.get("name") for t in tools],
+                    "messages": for_display(messages)})
+        t0 = time.monotonic()
         resp = await client.create(**kwargs)
+        await emit({"type": "api_response", "agent": agent, "call_id": call_id,
+                    "stop_reason": resp.get("stop_reason"), "usage": resp.get("usage", {}),
+                    "duration_ms": int((time.monotonic() - t0) * 1000)})
         u = resp.get("usage", {})
         usage["input_tokens"] += u.get("input_tokens", 0)
         usage["output_tokens"] += u.get("output_tokens", 0)
@@ -199,16 +220,18 @@ async def run_agent(
                                 "content": out, "is_error": is_error})
             messages.append({"role": "user", "content": results})
             continue
-        if stop == "max_tokens":
-            await emit({"type": "log", "level": "warn", "msg": f"{agent} hit max_tokens, output may be cut"})
         if stop == "pause_turn":
             continue  # long server-side search: send the paused turn back as-is
+        if stop not in COMPLETE_STOPS:
+            # max_tokens, refusal or an unknown reason: the turn is NOT a finished output.
+            await emit({"type": "log", "level": "warn", "msg": f"{agent}: incomplete turn (stop_reason={stop})"})
         await emit({"type": "agent_messages", "agent": agent, "messages": for_display(messages)})
         return AgentResult(text=last_text, messages=messages, usage=usage, turns=turn, stop_reason=stop)
 
+    # Budget exhausted: never treated as success.
     await emit({"type": "log", "level": "warn", "msg": f"{agent} reached max_turns={max_turns}"})
     await emit({"type": "agent_messages", "agent": agent, "messages": for_display(messages)})
-    return AgentResult(text=last_text, messages=messages, usage=usage, turns=max_turns, stop_reason=stop)
+    return AgentResult(text=last_text, messages=messages, usage=usage, turns=max_turns, stop_reason="max_turns")
 
 
 def extract_json(text: str) -> dict:

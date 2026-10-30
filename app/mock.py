@@ -59,7 +59,7 @@ class MockClient:
         }), "end_turn"
 
     def _researcher(self, q, turn, messages):
-        retry = "feedback from=\"analyst\"" in messages[0]["content"]
+        retry = "<feedback" in messages[0]["content"]
         if turn == 1:
             sid = _id("srvtoolu")
             return [
@@ -68,18 +68,22 @@ class MockClient:
                 {"type": "web_search_tool_result", "tool_use_id": sid, "content": [
                     {"type": "web_search_result", "url": u, "title": t, "page_age": a, "encrypted_content": "mock"}
                     for u, t, a in SOURCES]},
-                {"type": "tool_use", "id": _id("toolu"), "name": "fetch_page", "input": {"url": SOURCES[0][0]}},
-            ], "tool_use"
+            ] + [{"type": "tool_use", "id": _id("toolu"), "name": "fetch_page", "input": {"url": u}}
+                 for u, _, _ in SOURCES[:3]], "tool_use"
+        quotes = ["The relevant sentence from the page states the main finding clearly.",
+                  "Key facts and figures about the topic, published 2026.",
+                  "A second paragraph adds context and a supporting figure for 2026.",
+                  "The relevant sentence from the page states the main finding clearly."]
         n = 4 if retry else 3
-        findings = [{"claim": f"Finding {i + 1} about {q}", "source_url": SOURCES[i % 3][0],
-                     "source_title": SOURCES[i % 3][1], "quote": "…relevant sentence from the page…",
-                     "page_age": SOURCES[i % 3][2]} for i in range(n)]
+        findings = [{"id": f"f{i + 1}", "claim": f"Finding {i + 1} about {q}", "source_url": SOURCES[i % 3][0],
+                     "source_title": SOURCES[i % 3][1], "quote": quotes[i], "page_age": SOURCES[i % 3][2]}
+                    for i in range(n)]
         return _text({"findings": findings,
                       "sources": [{"url": u, "title": t, "page_age": a} for u, t, a in SOURCES[:3]],
                       "gaps": [] if retry else ["No figures for 2026 yet"]}), "end_turn"
 
     def _analyst(self, q, turn, messages):
-        retry = "feedback from=\"writer\"" in messages[0]["content"]
+        retry = "feedback from=\"orchestrator/writer\"" in messages[0]["content"]
         research = messages[0]["content"]
         if turn == 1:
             return [{"type": "text", "text": "Scoring each source with the source-evaluation skill."}] + [
@@ -93,10 +97,13 @@ class MockClient:
                               {"url": SOURCES[1][0], "score": 80, "tier": "A", "reason": "reputable media"},
                               {"url": SOURCES[2][0], "score": 65, "tier": "B", "reason": "reference, verify"}],
             "verified_facts": [
-                {"fact": f"Key verified fact about {q}", "sources": [SOURCES[0][0], SOURCES[1][0]],
-                 "confidence": "high", "note": "two independent sources agree"},
-                {"fact": "A supporting figure", "sources": [SOURCES[1][0]], "confidence": "medium",
-                 "note": "single reputable source"}],
+                {"id": "F1", "fact": f"Key verified fact about {q}", "based_on": ["f1", "f2"],
+                 "verification_status": "SUPPORTED", "confidence": "high", "primary": True,
+                 "independence": "official body and a news agency, different authors",
+                 "note": "two sources agree"},
+                {"id": "F2", "fact": "A supporting figure for 2026", "based_on": ["f3"],
+                 "verification_status": "PARTIALLY_SUPPORTED", "confidence": "medium",
+                 "independence": "single source", "note": "reference work, verify at the origin"}],
             "contradictions": [],
             "open_questions": ["Exact 2026 numbers are not published yet"],
             "outline": ["Short answer", "What the data says", "Risks", "Open questions"],
@@ -104,11 +111,12 @@ class MockClient:
 
     def _writer(self, q, turn, messages):
         md = (f"## Shrnutí\n\n- Hlavní zjištění k otázce „{q}“ potvrzují dva nezávislé zdroje [1][2].\n"
-              "- Podpůrné číslo pochází z jednoho důvěryhodného zdroje, ber ho opatrně [2].\n\n"
-              "## Co říkají data\n\nOficiální zdroj a zpravodajská agentura se shodují na hlavním trendu. "
-              "Přehledová encyklopedie to potvrzuje, ale slouží jen jako výchozí bod [1][3].\n\n"
+              "- Podpůrné číslo pochází z jednoho zdroje, ber ho opatrně [3].\n\n"
+              "## Co říkají data\n\nOficiální zdroj a zpravodajská agentura se shodují na hlavním trendu [1][2]. "
+              "Přehledová encyklopedie uvádí podpůrné číslo, ale slouží jen jako výchozí bod [3].\n\n"
               "## Rizika\n\nNejvětší nejistota je v aktuálních číslech za letošní rok, "
-              "která zatím nejsou zveřejněná [2].\n\n"
+              "která zatím nejsou zveřejněná [3].\n\n"
               "## Co nevíme\n\n- Přesná čísla za rok 2026.\n\n"
               "*Toto je ukázková odpověď v mock režimu (bez API klíče).*")
-        return _text({"handoff_check": {"ok": True, "missing": []}, "answer_markdown": md}), "end_turn"
+        return _text({"handoff_check": {"ok": True, "missing": []}, "used_facts": ["F1", "F2"],
+                      "answer_markdown": md}), "end_turn"

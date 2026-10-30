@@ -62,13 +62,13 @@ class AgentSpec:
         base = (PROMPTS_DIR / self.prompt_file).read_text(encoding="utf-8")
         return f"AGENT: {self.key}\n\n{base}" + "".join(s.as_prompt() for s in self.skills)
 
-    def tools(self, searches: int) -> tuple[list[dict], dict]:
-        """Tool schemas for the API + client-side implementations."""
+    def tools(self, searches: int, impls: dict) -> tuple[list[dict], dict]:
+        """Tool schemas for the API + this run's client-side implementations."""
         if self.key == "researcher":
-            return [T.web_search_tool(searches), T.FETCH_PAGE], {"fetch_page": T.fetch_page}
+            return [T.web_search_tool(searches), T.FETCH_PAGE], {"fetch_page": impls["fetch_page"]}
         if self.key == "analyst":
             return ([T.web_search_tool(max(2, searches // 2)), T.EVALUATE_SOURCE],
-                    {"evaluate_source": T.evaluate_source})
+                    {"evaluate_source": impls["evaluate_source"]})
         return [], {}
 
 
