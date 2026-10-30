@@ -19,12 +19,14 @@ flowchart LR
 
 ## Demo za 2 minuty
 
-1. Zeptej se třeba „Jaký je stav zavádění AI ve středních firmách v ČR?“ a sleduj karty: router vybere model,
-   Researcher volá 🌐 `web_search` a 🛠 `fetch_page`, v průběhu vpravo jsou vidět handoffy 🤝 a případné vrácení ↩.
-2. Klikni na kartu **Analyst** → záložka *Tools*: volání `evaluate_source` (skript skillu) a jeho skóre;
-   záložka *Skill*: celý SKILL.md.
-3. Klikni na **Writer** → *Handoff in*: co dostal a jestli prošel kontrakt; *Messages*: přesné pole poslané do API.
-   Pod odpovědí je kontrola výstupu, zdroje s tierem A–D a odhad ceny běhu.
+1. Přihlas se a zeptej se třeba „Jaký je stav zavádění AI ve středních firmách v ČR?“. Sleduj karty: router vybere
+   model, Researcher volá `web_search` (WEB v #PRŮBĚH) a `fetch_page` (TLS), handoffy jsou HND a případné vrácení RET.
+2. Klikni na kartu **Analyst** → záložka **#TOOLS**: volání `evaluate_source` (skript skillu) a jeho skóre;
+   **#SKILL**: celý SKILL.md a kolikrát se skript skutečně vykonal.
+3. Klikni na **Writer** → **#HANDOFF IN**: co dostal a jestli prošel kontrakt; **#API VOLÁNÍ**: přesné pole
+   `messages` poslané do API. Nad odpovědí jsou počítadla (ověřené citáty, podložená fakta), pod ní důkazy,
+   zdroje s tierem A–D, kontrola citací a odhad ceny.
+4. Polož doplňující otázku: projde stejnými agenty a navazuje na předchozí odpověď.
 
 ## Proč čtyři agenti (a kdy by stačil jeden prompt)
 
@@ -42,7 +44,7 @@ k rozhodnutí.
 | 3–4 subagenti s odlišnými rolemi | `app/agents.py`, system prompty v `prompts/*.md` |
 | UI ukazuje práci každého agenta, ne jen shrnutí | karty agentů, živý průběh, inspektor (klik na kartu); vzhled DESKY: monospace, 1px linky, barva jen pro stav, světlý/tmavý motiv |
 | Claude API voláno napřímo, bez LangChainu | `app/llm.py` – `httpx` POST na `/v1/messages`, vlastní tool loop |
-| Viditelná práce s messages, system prompt a tools | inspektor: záložky *System prompt*, *Messages* (přesné pole poslané do API), *Tools* |
+| Viditelná práce s messages, system prompt a tools | inspektor: záložky **#SYSTEM**, **#API VOLÁNÍ** (přesné pole `messages`), **#KONVERZACE**, **#TOOLS** |
 | Vlastní Skill se SKILL.md, reálně použitý | `skills/source-evaluation` (Analyst, i jako tool `evaluate_source`), `skills/plain-writing` (Writer), `skills/question-decomposition` (Router) |
 | Jasný handoff mezi agenty | `app/orchestrator.py` + kontrakty v `app/contracts.py`, v UI události HND a RET v #PRŮBĚH |
 | Agent s nástrojem, který opravdu volá | Researcher: `web_search` (server tool Anthropic) + `fetch_page` (náš klient); Analyst: `evaluate_source` + `find_in_source` + `web_search` |
@@ -77,7 +79,7 @@ Každý handoff má dvě kontroly:
 Když jedna z nich neprojde, orchestrátor vrátí práci předchozímu agentovi se seznamem, co chybí
 a s jeho předchozím výstupem (`MAX_RETURNS`, výchozí 1× na přechod). Každý pokus má jeden auditovatelný
 záznam `validation_result` (kontrakt v kódu + kontrola příjemcem + rozhodnutí `retry | continue |
-continue_partial | abort`), v UI v záložce **Validace**.
+continue_partial | abort`), v UI v záložce **#VALIDACE**.
 
 ### Konečné stavy běhu (nic se netváří jako hotové)
 
@@ -133,7 +135,7 @@ tvrzení) a **nezávislé potvrzení** (různé weby, různé znění, ne dvě k
 4. Kód z toho sestaví ledger: bez ověřeného citátu jistota max. `low`, `high` jen s ověřeným citátem
    a nezávislostí (nebo primárním zdrojem); nezávislost počítá kód z různých webů a různých citátů.
 5. Writer dostane jen podložená fakta, vrací `used_facts` a kód kontroluje, že každé `[n]` v odpovědi
-   patří k použitému faktu. V UI panel **Důkazy** ukazuje fakta, citáty a stav CITÁT OK / CITÁT ?.
+   patří k použitému faktu. V UI panel **#DŮKAZY** ukazuje fakta, citáty a stav CITÁT OK / CITÁT ?.
 
 ## Skills
 
@@ -158,14 +160,14 @@ Skript lze pustit i ručně: `python skills/source-evaluation/scripts/score_sour
 
 Klikni na kartu agenta. Inspektor ukazuje:
 
-- **System prompt**: role + připojené skills, přesně jak šly do API,
-- **API volání**: každý POST zvlášť (Request N / Response N) se snímkem `messages` v okamžiku odeslání,
+- **#SYSTEM**: role + připojené skills, přesně jak šly do API,
+- **#API VOLÁNÍ**: každý POST zvlášť (Request N / Response N) se snímkem `messages` v okamžiku odeslání,
   `stop_reason`, tokeny a délkou; zobrazená verze je redigovaná (bez `encrypted_content`),
-- **Finální konverzace**: pole `messages` po doběhnutí agenta,
-- **Validace**: záznamy o předáních, kde agent byl odesílatel nebo příjemce,
-- **Tools**: JSON definice nástrojů a každé volání se vstupem a výsledkem,
-- **Výstup** a **Handoff in**: co agent vrátil a co dostal, včetně výsledku kontraktu,
-- **Skill**: celý SKILL.md a skutečné vykonání (`skill_loaded` = načteno do promptu, `skill_result` =
+- **#KONVERZACE**: pole `messages` po doběhnutí agenta,
+- **#VALIDACE**: záznamy o předáních, kde agent byl odesílatel nebo příjemce,
+- **#TOOLS**: JSON definice nástrojů a každé volání se vstupem a výsledkem,
+- **#VÝSTUP** a **#HANDOFF IN**: co agent vrátil a co dostal, včetně výsledku kontraktu,
+- **#SKILL**: celý SKILL.md a skutečné vykonání (`skill_loaded` = načteno do promptu, `skill_result` =
   kolikrát se zavolal `evaluate_source` a pokrytí zdrojů; nepokrytý zdroj je chyba kontraktu).
 
 Každý běh se loguje do `logs/<run_id>.jsonl` (retence `LOG_RETENTION_DAYS`, výchozí 7 dní) a trace je
