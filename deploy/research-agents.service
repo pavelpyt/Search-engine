@@ -5,6 +5,7 @@ After=network.target
 [Service]
 WorkingDirectory=/opt/research-agents
 EnvironmentFile=/etc/research-agents.env
+Environment=TRUST_PROXY=1
 ExecStart=/opt/research-agents/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8090 --proxy-headers
 Restart=on-failure
 User=www-data

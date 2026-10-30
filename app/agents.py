@@ -16,6 +16,26 @@ MODELS = {
     "strong": os.getenv("MODEL_STRONG", "claude-opus-5-5"),
 }
 
+# USD per million tokens (input, output). Estimates for the cost shown in the UI;
+# override with PRICE_<TIER>="in,out" if your contract differs.
+def _price(tier: str, default: tuple[float, float]) -> tuple[float, float]:
+    raw = os.getenv(f"PRICE_{tier.upper()}")
+    return tuple(float(x) for x in raw.split(",")) if raw else default
+
+
+PRICES = {
+    MODELS["fast"]: _price("fast", (1.0, 5.0)),
+    MODELS["balanced"]: _price("balanced", (2.0, 10.0)),
+    MODELS["strong"]: _price("strong", (4.0, 20.0)),
+}
+WEB_SEARCH_USD = float(os.getenv("PRICE_WEB_SEARCH", "0.01"))  # per search
+
+
+def estimate_cost(model: str, input_tokens: int, output_tokens: int, web_searches: int = 0) -> float:
+    p_in, p_out = PRICES.get(model, (2.0, 10.0))
+    return round(input_tokens / 1e6 * p_in + output_tokens / 1e6 * p_out + web_searches * WEB_SEARCH_USD, 4)
+
+
 # The router decides complexity; this table (in code, not in a prompt) turns it
 # into a model per agent and a search budget.
 MODEL_PLAN = {

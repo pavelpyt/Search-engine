@@ -94,3 +94,68 @@ def test_full_pipeline_in_mock_mode_with_one_return():
     assert any(e["type"] == "skill_used" and e["skill"] == "source-evaluation" for e in events)
     assert any(e["type"] == "tool_call" and e["name"] == "evaluate_source" for e in events)
     assert result["quality"]["passed"]
+
+
+def test_domain_rules_match_whole_labels():
+    assert _score.score("https://fun.org")["source_type"] == "unknown"
+    assert _score.score("https://microsoft.com")["source_type"] == "unknown"
+    assert _score.score("https://news.un.org/x")["source_type"] == "official"
+    assert _score.score("https://docs.python.org/3/")["tier"] == "B"  # matches SKILL.md
+
+
+def test_extract_json_skips_braces_in_narration():
+    text = 'I searched {two} sources. Final:\n{"findings": [{"claim": "x"}], "gaps": []}'
+    assert extract_json(text)["findings"][0]["claim"] == "x"
+
+
+class BadJsonThenGood:
+    """First reply is not JSON; the repair turn returns JSON."""
+    def __init__(self):
+        self.calls = 0
+
+    async def create(self, **kw):
+        self.calls += 1
+        text = "Sorry, here you go: findings are..." if self.calls == 1 else '{"complexity": "simple", "subquestions": ["a"]}'
+        return {"stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1},
+                "content": [{"type": "text", "text": text}]}
+
+
+def test_invalid_json_gets_one_repair_turn():
+    events = []
+
+    async def emit(e):
+        events.append(e)
+
+    client = BadJsonThenGood()
+    data = run(Pipeline(client, emit).call("router", "fast", "<question>q</question>"))
+    assert data["complexity"] == "simple" and client.calls == 2
+    assert any(e["type"] == "log" and "invalid JSON" in e["msg"] for e in events)
+
+
+def test_retry_on_overload(monkeypatch):
+    import httpx
+    from app import llm
+
+    responses = [httpx.Response(529, json={"error": "overloaded"}, headers={"retry-after": "0"}),
+                 httpx.Response(200, json={"content": [], "stop_reason": "end_turn", "usage": {}})]
+
+    async def fake_post(*a, **kw):
+        return responses.pop(0)
+
+    client = llm.MessagesClient("test-key")
+    monkeypatch.setattr(client.http, "post", fake_post)
+    retries = []
+
+    async def on_retry(n, d):
+        retries.append(n)
+
+    resp = run(client.create(model="m", system="s", messages=[], on_retry=on_retry))
+    assert resp["stop_reason"] == "end_turn" and retries == [1]
+
+
+def test_display_copy_hides_encrypted_content():
+    from app.llm import for_display
+    msg = [{"role": "assistant", "content": [{"type": "web_search_tool_result",
+                                              "content": [{"url": "u", "encrypted_content": "SECRETBLOB"}]}]}]
+    shown = for_display(msg)
+    assert "SECRETBLOB" not in str(shown) and msg[0]["content"][0]["content"][0]["encrypted_content"] == "SECRETBLOB"

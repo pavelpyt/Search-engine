@@ -18,7 +18,7 @@ import time
 from typing import Awaitable, Callable
 
 from . import contracts as C
-from .agents import AGENTS, MODEL_PLAN, MODELS
+from .agents import AGENTS, MODEL_PLAN, MODELS, estimate_cost
 from .llm import run_agent, extract_json
 
 MAX_RETURNS = int(os.getenv("MAX_RETURNS", "1"))
@@ -42,20 +42,38 @@ class Pipeline:
         for skill in spec.skills:
             await self.emit({"type": "skill_used", "agent": key, "skill": skill.name,
                              "version": skill.version, "description": skill.description})
-        result = await run_agent(client=self.client, agent=key, model=model,
-                                 system=spec.system_prompt(), user_content=user_content,
-                                 tools=tool_defs, client_tools=impls, emit=self.emit)
-        u = self.usage.setdefault(key, {"model": model, "input_tokens": 0, "output_tokens": 0})
-        u["model"] = model
-        u["input_tokens"] += result.usage["input_tokens"]
-        u["output_tokens"] += result.usage["output_tokens"]
-        await self.emit({"type": "usage", "agent": key, **u})
+        system = spec.system_prompt()
+        result = await run_agent(client=self.client, agent=key, model=model, system=system,
+                                 user_content=user_content, tools=tool_defs, client_tools=impls, emit=self.emit)
+        self.add_usage(key, model, result.usage)
+        await self.emit({"type": "usage", "agent": key, **self.usage[key]})
         try:
             data = extract_json(result.text)
         except Exception as exc:
-            raise RuntimeError(f"{key} did not return valid JSON: {exc}") from exc
+            # One repair turn: same conversation, the parse error, "JSON only".
+            await self.emit({"type": "log", "level": "warn", "msg": f"{key}: invalid JSON ({exc}), asking once to fix it"})
+            cut = " Your reply was cut off by the token limit: be more concise." if result.stop_reason == "max_tokens" else ""
+            repair = result.messages + [{"role": "user", "content":
+                     f"Your last reply was not one valid JSON object ({exc}).{cut} "
+                     "Reply again with ONLY the JSON object described in your instructions, no other text."}]
+            result = await run_agent(client=self.client, agent=key, model=model, system=system, messages=repair,
+                                     tools=tool_defs, client_tools=impls, emit=self.emit, max_turns=2)
+            self.add_usage(key, model, result.usage)
+            await self.emit({"type": "usage", "agent": key, **self.usage[key]})
+            try:
+                data = extract_json(result.text)
+            except Exception as exc2:
+                raise RuntimeError(f"{key} did not return valid JSON after a repair attempt: {exc2}") from exc2
         await self.emit({"type": "agent_output", "agent": key, "output": data})
         return data
+
+    def add_usage(self, key: str, model: str, usage: dict):
+        u = self.usage.setdefault(key, {"model": model, "input_tokens": 0, "output_tokens": 0,
+                                        "web_searches": 0, "cost_usd": 0.0})
+        u["model"] = model
+        for k in ("input_tokens", "output_tokens", "web_searches"):
+            u[k] += usage.get(k, 0)
+        u["cost_usd"] = estimate_cost(model, u["input_tokens"], u["output_tokens"], u["web_searches"])
 
     async def handoff(self, src: str, dst: str, payload: dict, code_missing: list[str]):
         await self.emit({"type": "handoff", "from": src, "to": dst, "payload": payload,
@@ -77,30 +95,39 @@ class Pipeline:
         await self.status("router", "done", f"Náročnost: {r['complexity']}")
         return r
 
-    async def research(self, question: str, route: dict, feedback: list[str] | None = None) -> dict:
+    async def research(self, question: str, route: dict, feedback: list[str] | None = None,
+                       previous: dict | None = None) -> dict:
         plan = MODEL_PLAN[route["complexity"]]
         step = "Dohledávám, co chtěl analytik" if feedback else "Hledám na webu a čtu zdroje"
         await self.status("researcher", "working", step)
-        payload = {"question": question, "subquestions": route["subquestions"],
+        payload = {"question": question, "goal": route.get("goal"), "subquestions": route["subquestions"],
                    "language": route.get("language", "same as question")}
         content = f"<handoff from=\"router\">\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n</handoff>"
         if feedback:
             content += ("\n\n<feedback from=\"analyst\">The analyst returned your work. Missing:\n- "
-                        + "\n- ".join(feedback) + "\nKeep your previous findings and add what is missing.</feedback>")
+                        + "\n- ".join(feedback) + "\nKeep your previous findings (below) and add what is missing. "
+                        "Return the complete merged JSON.</feedback>")
+            if previous:
+                content += ("\n\n<previous_research>\n" + json.dumps(previous, ensure_ascii=False, indent=2)
+                            + "\n</previous_research>")
         r = await self.call("researcher", plan["researcher"], content, searches=plan["searches"])
         await self.status("researcher", "done", f"{len(r.get('findings', []))} zjištění, "
                                                 f"{len({f.get('source_url') for f in r.get('findings', [])})} zdrojů")
         return r
 
-    async def analyse(self, question: str, route: dict, research: dict, feedback: list[str] | None = None) -> dict:
+    async def analyse(self, question: str, route: dict, research: dict, feedback: list[str] | None = None,
+                      previous: dict | None = None) -> dict:
         plan = MODEL_PLAN[route["complexity"]]
         step = "Doplňuji, co chtěl writer" if feedback else "Hodnotím zdroje a ověřuji tvrzení"
         await self.status("analyst", "working", step)
-        content = (f"<question>{question}</question>\n<handoff from=\"researcher\">\n"
+        content = (f"<question>{question}</question>\n<goal>{route.get('goal', '')}</goal>\n<handoff from=\"researcher\">\n"
                    f"{json.dumps(research, ensure_ascii=False, indent=2)}\n</handoff>")
         if feedback:
             content += ("\n\n<feedback from=\"writer\">The writer returned your work. Missing:\n- "
-                        + "\n- ".join(feedback) + "</feedback>")
+                        + "\n- ".join(feedback) + "\nReturn the complete corrected JSON.</feedback>")
+            if previous:
+                content += ("\n\n<previous_analysis>\n" + json.dumps(previous, ensure_ascii=False, indent=2)
+                            + "\n</previous_analysis>")
         a = await self.call("analyst", plan["analyst"], content, searches=plan["searches"])
         await self.status("analyst", "done", f"{len(a.get('verified_facts', []))} ověřených faktů")
         return a
@@ -108,8 +135,8 @@ class Pipeline:
     async def write(self, question: str, route: dict, analysis: dict, sources: list[dict]) -> dict:
         plan = MODEL_PLAN[route["complexity"]]
         await self.status("writer", "working", "Píšu odpověď")
-        payload = {"question": question, "language": route.get("language"),
-                   "analysis": analysis, "sources": sources}
+        payload = {"question": question, "goal": route.get("goal"), "complexity": route["complexity"],
+                   "language": route.get("language"), "analysis": analysis, "sources": sources}
         content = f"<handoff from=\"analyst\">\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n</handoff>"
         w = await self.call("writer", plan["writer"], content)
         await self.status("writer", "done", "Odpověď hotová")
@@ -132,7 +159,7 @@ class Pipeline:
             if missing and returns < MAX_RETURNS:
                 returns += 1
                 await self.status("researcher", "returned", "Kontrakt nesplněn: " + "; ".join(missing))
-                research = await self.research(question, route, feedback=missing)
+                research = await self.research(question, route, feedback=missing, previous=research)
                 continue
             analysis = await self.analyse(question, route, research)
             check = analysis.get("handoff_check") or {}
@@ -141,7 +168,7 @@ class Pipeline:
                 await self.emit({"type": "handoff_return", "from": "analyst", "to": "researcher",
                                  "missing": check.get("missing", [])})
                 await self.status("researcher", "returned", "Analytik chce doplnit")
-                research = await self.research(question, route, feedback=check.get("missing", []))
+                research = await self.research(question, route, feedback=check.get("missing", []), previous=research)
                 continue
             break
 
@@ -158,7 +185,7 @@ class Pipeline:
             if missing and w_returns < MAX_RETURNS:
                 w_returns += 1
                 await self.status("analyst", "returned", "Kontrakt nesplněn: " + "; ".join(missing))
-                analysis = await self.analyse(question, route, research, feedback=missing)
+                analysis = await self.analyse(question, route, research, feedback=missing, previous=analysis)
                 sources = self.number_sources(research, analysis)
                 continue
             writer = await self.write(question, route, analysis, sources)
@@ -168,7 +195,7 @@ class Pipeline:
                 await self.emit({"type": "handoff_return", "from": "writer", "to": "analyst",
                                  "missing": check.get("missing", [])})
                 await self.status("analyst", "returned", "Writer chce doplnit")
-                analysis = await self.analyse(question, route, research, feedback=check.get("missing", []))
+                analysis = await self.analyse(question, route, research, feedback=check.get("missing", []), previous=analysis)
                 sources = self.number_sources(research, analysis)
                 continue
             break
@@ -180,6 +207,7 @@ class Pipeline:
         quality = C.quality_report(markdown, sources)
         result = {"answer_markdown": markdown, "sources": sources, "quality": quality,
                   "complexity": route["complexity"], "usage": self.usage,
+                  "cost_usd": round(sum(u["cost_usd"] for u in self.usage.values()), 4),
                   "duration_s": round(time.monotonic() - t0, 1)}
         await self.emit({"type": "final", **result})
         return result

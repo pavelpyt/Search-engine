@@ -3,6 +3,8 @@
 const $ = (s, el = document) => el.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const json = (o) => JSON.stringify(o, null, 2);
+const safeUrl = (u) => (/^https?:\/\//i.test(String(u || "")) ? u : "#");
+const usd = (n) => (n == null ? "" : n < 0.01 ? "< $0.01" : `$${n.toFixed(2)}`);
 
 const STATUS_CZ = { idle: "čeká", working: "pracuje", done: "hotovo", returned: "vráceno", error: "chyba" };
 const EXAMPLES = [
@@ -59,7 +61,7 @@ function updateCard(key) {
   $(".step", card).textContent = a.step || "";
   const m = $(".chip.model", card), t = $(".chip.tokens", card);
   if (a.model) { m.textContent = a.model.replace("claude-", ""); m.classList.remove("hidden"); }
-  if (a.usage) { t.textContent = `${a.usage.input_tokens + a.usage.output_tokens} tok`; t.classList.remove("hidden"); }
+  if (a.usage) { t.textContent = `${a.usage.input_tokens + a.usage.output_tokens} tok · ${usd(a.usage.cost_usd)}`; t.classList.remove("hidden"); }
 }
 
 function setEdge(from, to, cls, label) {
@@ -148,7 +150,7 @@ function onEvent(e) {
       break;
     case "final":
       renderAnswer(e);
-      log("✅", `Hotovo za ${e.duration_s} s · kontrola výstupu ${e.quality.passed ? "✓" : "⚠"}`);
+      log("✅", `Hotovo za ${e.duration_s} s · odhad ceny ${usd(e.cost_usd)} · kontrola výstupu ${e.quality.passed ? "✓" : "⚠"}`);
       break;
     case "error":
       log("⛔", esc(e.msg), "err");
@@ -173,14 +175,14 @@ function renderAnswer(e) {
   const md = (e.answer_markdown || "").replace(/\[(\d+)\]/g, (m, n) => `<a class="cite" href="#src-${n}">[${n}]</a>`);
   const html = DOMPurify.sanitize(marked.parse(md), { ADD_ATTR: ["target"] });
   const sources = e.sources.map((s) => `<li id="src-${s.n}">${s.tier ? `<span class="tier ${s.tier}" title="score ${s.score ?? "?"}">${s.tier}</span>` : ""}
-      <a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.title)}</a></li>`).join("");
+      <a href="${esc(safeUrl(s.url))}" target="_blank" rel="noopener noreferrer">${esc(s.title)}</a></li>`).join("");
   const q = e.quality;
   const checks = q.checks.map((c) => `<li>${c.ok ? "✅" : "⚠️"} ${esc(c.name)} <span class="note">${esc(c.detail)}</span></li>`).join("");
-  const usage = Object.entries(e.usage).map(([k, u]) => `${label(k)}: ${u.model.replace("claude-", "")} · ${u.input_tokens + u.output_tokens} tok`).join(" · ");
+  const usage = Object.entries(e.usage).map(([k, u]) => `${label(k)}: ${u.model.replace("claude-", "")} · ${u.input_tokens + u.output_tokens} tok · ${usd(u.cost_usd)}`).join(" · ");
   el.innerHTML = `<div class="prose">${html}</div>
     <div class="sources"><b>Zdroje</b> <span class="note">(tier A–D ze skillu source-evaluation)</span><ol>${sources}</ol></div>
     <details class="quality" ${q.passed ? "" : "open"}><summary>Kontrola výstupu: ${q.passed ? "✓ prošla" : "⚠ našla problémy"} · ${q.words} slov · citováno ${q.cited.length}/${e.sources.length} zdrojů</summary><ul>${checks}</ul></details>
-    <div class="runmeta">Složitost: <b>${esc(e.complexity)}</b> · ${e.duration_s} s · ${esc(usage)}</div>`;
+    <div class="runmeta">Složitost: <b>${esc(e.complexity)}</b> · ${e.duration_s} s · odhad ceny běhu <b>${usd(e.cost_usd)}</b><br>${esc(usage)}</div>`;
 }
 
 // ---------- inspector ----------

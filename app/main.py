@@ -6,7 +6,7 @@ import json
 import os
 import time
 import uuid
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from sse_starlette.sse import EventSourceResponse
 
 from .agents import AGENTS, MODEL_PLAN, MODELS
-from .llm import MessagesClient, make_client
+from .llm import is_mock, make_client
 from .orchestrator import Pipeline
 from .skills import list_skills
 
@@ -31,7 +31,10 @@ app = FastAPI(title="Research Agents")
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 
 _runs_by_ip: dict[str, deque] = defaultdict(deque)
-RUNS: dict[str, list[dict]] = {}
+RUNS: "OrderedDict[str, list[dict]]" = OrderedDict()   # last MAX_RUNS_IN_MEMORY runs, older ones live in logs/
+MAX_RUNS_IN_MEMORY = 50
+TRUST_PROXY = os.getenv("TRUST_PROXY", "0") == "1"      # set to 1 behind Caddy/nginx
+CONCURRENCY = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT_RUNS", "3")))
 
 
 @app.get("/")
@@ -41,9 +44,8 @@ async def index():
 
 @app.get("/api/config")
 async def config():
-    client = make_client()
     return {
-        "mock": not isinstance(client, MessagesClient),
+        "mock": is_mock(),
         "access_code_required": bool(ACCESS_CODE),
         "agents": [{"key": a.key, "label": a.label, "emoji": a.emoji, "role": a.role,
                     "skills": a.skill_names} for a in AGENTS.values()],
@@ -82,16 +84,28 @@ def _rate_limited(ip: str) -> bool:
 @app.get("/api/run")
 async def run(request: Request, q: str = Query(..., min_length=3), code: str = ""):
     question = q.strip()[:MAX_QUESTION]
+    # Refusals go out as an SSE event: EventSource cannot read an HTTP 401/429 body.
+    refusal = None
     if ACCESS_CODE and code != ACCESS_CODE:
-        raise HTTPException(401, "Wrong access code")
-    ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "?").split(",")[0]
-    if _rate_limited(ip):
-        raise HTTPException(429, "Too many runs, try again later")
+        refusal = "Špatný přístupový kód."
+    else:
+        ip = request.client.host if request.client else "?"
+        if TRUST_PROXY and request.headers.get("x-forwarded-for"):
+            ip = request.headers["x-forwarded-for"].split(",")[-1].strip()  # the hop our proxy added
+        if _rate_limited(ip):
+            refusal = "Limit dotazů na hodinu vyčerpán, zkus to později."
+    if refusal:
+        async def refuse():
+            yield {"data": json.dumps({"type": "error", "msg": refusal}, ensure_ascii=False)}
+            yield {"data": json.dumps({"type": "run_finished"})}
+        return EventSourceResponse(refuse())
 
     run_id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     queue: asyncio.Queue = asyncio.Queue()
     events: list[dict] = []
     RUNS[run_id] = events
+    while len(RUNS) > MAX_RUNS_IN_MEMORY:
+        RUNS.popitem(last=False)
     log_file = (LOG_DIR / f"{run_id}.jsonl").open("a", encoding="utf-8")
 
     async def emit(event: dict):
@@ -104,7 +118,10 @@ async def run(request: Request, q: str = Query(..., min_length=3), code: str = "
     async def worker():
         try:
             await emit({"type": "run_started", "question": question})
-            await Pipeline(make_client(), emit).run(question)
+            if CONCURRENCY.locked():
+                await emit({"type": "log", "level": "info", "msg": "Čekám ve frontě na volný běh…"})
+            async with CONCURRENCY:
+                await Pipeline(make_client(), emit).run(question)
         except asyncio.CancelledError:
             await emit({"type": "error", "msg": "Run cancelled (client disconnected)"})
             raise

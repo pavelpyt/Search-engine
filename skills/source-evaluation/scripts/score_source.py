@@ -16,15 +16,26 @@ from datetime import date
 from urllib.parse import urlparse
 
 # (source_type, base score, matcher). First match wins.
+# Domains are matched as whole labels: "un.org" matches "un.org" and
+# "news.un.org", never "fun.org".
+def _domains(*names: str) -> re.Pattern:
+    return re.compile(r"(^|\.)(" + "|".join(re.escape(n) for n in names) + r")$")
+
+
 RULES: list[tuple[str, int, re.Pattern]] = [
-    ("official", 90, re.compile(r"(\.gov(\.[a-z]{2})?$|\.gov\.cz$|europa\.eu$|who\.int$|un\.org$|oecd\.org$|czso\.cz$|cnb\.cz$|mfcr\.cz$|justice\.cz$)")),
-    ("research", 85, re.compile(r"(\.edu$|\.ac\.[a-z]{2}$|arxiv\.org$|doi\.org$|nature\.com$|sciencedirect\.com$|ncbi\.nlm\.nih\.gov$|pubmed|springer\.com$|acm\.org$|ieee\.org$)")),
-    ("reputable_media", 75, re.compile(r"(reuters\.com$|apnews\.com$|bbc\.(co\.uk|com)$|ft\.com$|economist\.com$|nytimes\.com$|wsj\.com$|bloomberg\.com$|theguardian\.com$|ct24\.ceskatelevize\.cz$|irozhlas\.cz$|seznamzpravy\.cz$|hn\.cz$|e15\.cz$|forbes\.(com|cz)$|denikn\.cz$)")),
-    ("reference", 65, re.compile(r"(wikipedia\.org$|britannica\.com$)")),
-    ("vendor_docs", 60, re.compile(r"(^docs\.|^developer\.|^platform\.|github\.com$|readthedocs\.io$)")),
-    ("blog", 45, re.compile(r"(medium\.com$|substack\.com$|blogspot\.|wordpress\.com$|^blog\.)")),
-    ("forum", 35, re.compile(r"(reddit\.com$|quora\.com$|stackexchange\.com$|stackoverflow\.com$|discord\.)")),
-    ("social", 30, re.compile(r"(x\.com$|twitter\.com$|facebook\.com$|tiktok\.com$|instagram\.com$|linkedin\.com$|youtube\.com$)")),
+    ("official", 90, re.compile(r"(^|\.)(gov|gov\.[a-z]{2}|europa\.eu|who\.int|un\.org|oecd\.org|czso\.cz|cnb\.cz|mfcr\.cz|justice\.cz)$")),
+    ("research", 85, re.compile(r"(^|\.)(edu|ac\.[a-z]{2}|arxiv\.org|doi\.org|nature\.com|sciencedirect\.com|ncbi\.nlm\.nih\.gov|pubmed\.ncbi\.nlm\.nih\.gov|springer\.com|acm\.org|ieee\.org)$")),
+    ("reputable_media", 75, _domains("reuters.com", "apnews.com", "bbc.co.uk", "bbc.com", "ft.com", "economist.com",
+                                     "nytimes.com", "wsj.com", "bloomberg.com", "theguardian.com",
+                                     "ct24.ceskatelevize.cz", "irozhlas.cz", "seznamzpravy.cz", "hn.cz", "e15.cz",
+                                     "forbes.com", "forbes.cz", "denikn.cz")),
+    ("reference", 65, _domains("wikipedia.org", "britannica.com")),
+    # Vendor docs sit at the bottom of tier B, as SKILL.md says.
+    ("vendor_docs", 65, re.compile(r"(^(docs|developer|developers|platform)\.)|((^|\.)(github\.com|readthedocs\.io)$)")),
+    ("blog", 45, re.compile(r"((^|\.)(medium\.com|substack\.com|wordpress\.com))$|(\.blogspot\.)|(^blog\.)")),
+    ("forum", 35, _domains("reddit.com", "quora.com", "stackexchange.com", "stackoverflow.com", "discord.com")),
+    ("social", 30, _domains("x.com", "twitter.com", "facebook.com", "tiktok.com", "instagram.com",
+                            "linkedin.com", "youtube.com")),
 ]
 
 TIERS = [(80, "A"), (65, "B"), (45, "C"), (0, "D")]

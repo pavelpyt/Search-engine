@@ -1,6 +1,6 @@
 ---
 name: plain-writing
-description: Write a research answer the way Pavel likes to read it – answer first, short and concrete, every claim cited, facts kept apart from estimates, and an honest list of what we don't know. Use for the final user-facing answer.
+description: Write a research answer for a busy reader – answer first, short and concrete, every claim cited, facts kept apart from estimates, and an honest list of what we don't know. Use for the final user-facing answer.
 version: "1.0"
 ---
 

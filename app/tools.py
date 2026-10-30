@@ -65,9 +65,9 @@ def _is_public(host: str) -> bool:
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror:
-        # Not resolvable locally (e.g. egress through a proxy): the HTTP request
-        # itself will fail or be resolved by the proxy, which cannot reach our LAN.
-        return True
+        # Unresolvable here. Allowed only behind an egress proxy that resolves
+        # names itself and cannot reach our network (set ALLOW_UNRESOLVED=1).
+        return os.getenv("ALLOW_UNRESOLVED") == "1"
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
@@ -75,21 +75,37 @@ def _is_public(host: str) -> bool:
     return True
 
 
+MAX_REDIRECTS = 3
+
+
 async def fetch_page(args: dict) -> str:
     url = str(args.get("url", ""))
-    parsed = urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        return "Rejected: only absolute public http(s) URLs."
     if os.getenv("MOCK_FETCH") == "1":
         return f"[mock] Readable text of {url}: key facts and figures about the topic, published 2026."
-    if not await asyncio.to_thread(_is_public, parsed.hostname):
-        return "Rejected: private or unresolvable host."
-    async with httpx.AsyncClient(timeout=15, follow_redirects=True,
+    async with httpx.AsyncClient(timeout=15, follow_redirects=False,
                                  headers={"User-Agent": "ResearchAgents/1.0 (+demo)"}) as http:
-        resp = await http.get(url)
-    if resp.status_code >= 400:
-        return f"HTTP {resp.status_code} for {url}"
-    html = resp.text[:MAX_FETCH_BYTES]
+        for _ in range(MAX_REDIRECTS + 1):
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                return "Rejected: only absolute public http(s) URLs."
+            # Every hop is checked, so a public URL cannot redirect to a private one.
+            if not await asyncio.to_thread(_is_public, parsed.hostname):
+                return "Rejected: private or unresolvable host."
+            async with http.stream("GET", url) as resp:
+                if resp.is_redirect and resp.headers.get("location"):
+                    url = str(resp.url.join(resp.headers["location"]))
+                    continue
+                if resp.status_code >= 400:
+                    return f"HTTP {resp.status_code} for {url}"
+                body = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    body.extend(chunk)
+                    if len(body) >= MAX_FETCH_BYTES:  # stop downloading at 2 MB
+                        break
+                html = bytes(body[:MAX_FETCH_BYTES]).decode(resp.encoding or "utf-8", errors="replace")
+                break
+        else:
+            return f"Too many redirects for {args.get('url')}"
     text = await asyncio.to_thread(trafilatura.extract, html, include_comments=False, include_tables=True)
     if not text:
         return f"No readable text extracted from {url}"
