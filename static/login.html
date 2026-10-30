@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Research Agents</title>
+<script>(function(){try{var t=localStorage.getItem("ui:theme");if(t)document.documentElement.dataset.theme=t;}catch(e){}})();</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<main class="login">
+  <form id="login" class="login-card">
+    <h1>RESEARCH AGENTS</h1>
+    <span class="lbl">PŘIHLÁŠENÍ</span>
+    <div class="field">
+      <label class="lbl" for="username">UŽIVATEL</label>
+      <input id="username" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required autofocus>
+    </div>
+    <div class="field">
+      <label class="lbl" for="password">HESLO</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+    </div>
+    <p id="error" class="login-error hidden" role="alert"></p>
+    <button id="submit" type="submit" class="btn primary">PŘIHLÁSIT</button>
+  </form>
+</main>
+<script src="/static/login.js"></script>
+</body>
+</html>

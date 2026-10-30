@@ -349,8 +349,9 @@ let hasSession = false;
 
 async function ensureSession() {
   if (hasSession) return true;
+  if (CONFIG.login_required) { location.href = "/login"; return false; }  // the session expired
   const r = await fetch("/api/session", { method: "POST", headers: { "content-type": "application/json" },
-    credentials: "same-origin", body: JSON.stringify({ code: $("#code").value }) });
+    credentials: "same-origin", body: "{}" });
   hasSession = r.ok;
   return r.ok;
 }
@@ -369,7 +370,7 @@ async function start(question) {
   thread.insertAdjacentHTML("beforeend", `<div class="msg user${parent_id ? " followup" : ""}">${esc(question)}</div><div class="msg bot pending">BĚŽÍ · agenti pracují, sleduj karty nahoře a #PRŮBĚH.</div>`);
   thread.scrollTop = thread.scrollHeight;
   const fail = (msg) => { onEvent({ type: "error", msg }); $("#send").disabled = false; };
-  if (!(await ensureSession())) return fail("Špatný přístupový kód.");
+  if (!(await ensureSession())) return fail("Nepodařilo se založit relaci.");
   let r = await fetch("/api/jobs", { method: "POST", headers: { "content-type": "application/json" },
     credentials: "same-origin", body });
   if (r.status === 401) { hasSession = false; if (await ensureSession()) r = await fetch("/api/jobs", { method: "POST", headers: { "content-type": "application/json" }, credentials: "same-origin", body }); }
@@ -407,11 +408,20 @@ function renderHow() {
 }
 
 async function init() {
-  CONFIG = await fetch("/api/config").then((r) => r.json());
+  const cfg = await fetch("/api/config");
+  if (cfg.status === 401) { location.href = "/login"; return; }
+  CONFIG = await cfg.json();
+  hasSession = CONFIG.login_required;  // this page is only served to a logged-in session
   $("#mode").textContent = CONFIG.mock ? "MOCK REŽIM" : "LIVE · CLAUDE API";
   $("#mode").className = `tag ${CONFIG.mock ? "warn" : "good"}`;
   setupTheme();
-  if (CONFIG.access_code_required) $("#codeField").classList.remove("hidden");
+  if (CONFIG.login_required) {
+    $("#logoutBtn").classList.remove("hidden");
+    $("#logoutBtn").addEventListener("click", async () => {
+      await fetch("/api/logout", { method: "POST", credentials: "same-origin" });
+      location.href = "/login";
+    });
+  }
   state = freshState();
   renderPipeline();
   renderHow();

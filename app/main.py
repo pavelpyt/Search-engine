@@ -1,8 +1,10 @@
 """FastAPI app: serves the UI, runs pipelines as jobs and streams their events over SSE.
 
 Security for a public demo:
-- POST /api/session exchanges the access code (in the JSON body, never in a URL)
-  for an HttpOnly session cookie.
+- With LOGIN_USER_SHA256 / LOGIN_PASS_SHA256 set, only /login and /static answer
+  without a session. The server keeps nothing but the SHA-256 hashes.
+- POST /api/session exchanges the credentials (in the JSON body, never in a URL)
+  for an HttpOnly session cookie. Repeated failures from one IP are blocked.
 - POST /api/jobs takes the question in the body; the SSE URL carries only the job id.
   A follow-up names its parent job; the context stays on the server, the browser never supplies it.
 - A job's events and trace are readable only by the session that started it.
@@ -12,6 +14,7 @@ Security for a public demo:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import secrets
@@ -21,9 +24,9 @@ from collections import OrderedDict, defaultdict, deque
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from .agents import AGENTS, MODEL_PLAN, MODELS
@@ -36,7 +39,10 @@ LOG_DIR = Path(os.getenv("LOG_DIR", ROOT / "logs"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_RETENTION_DAYS = int(os.getenv("LOG_RETENTION_DAYS", "7"))
 
-ACCESS_CODE = os.getenv("ACCESS_CODE", "")
+LOGIN_USER_SHA256 = os.getenv("LOGIN_USER_SHA256", "").strip().lower()
+LOGIN_PASS_SHA256 = os.getenv("LOGIN_PASS_SHA256", "").strip().lower()
+LOGIN_REQUIRED = bool(LOGIN_USER_SHA256 or LOGIN_PASS_SHA256)  # one hash missing locks everyone out, never opens up
+MAX_FAILED_LOGINS, FAILED_LOGIN_WINDOW = 10, 900
 RUNS_PER_HOUR = int(os.getenv("RUNS_PER_HOUR", "20"))
 TRUST_PROXY = os.getenv("TRUST_PROXY", "0") == "1"
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "1") == "1"
@@ -45,11 +51,12 @@ MAX_QUESTION = 500
 MAX_JOBS_IN_MEMORY = 50
 COOKIE = "ra_session"
 
-app = FastAPI(title="Research Agents")
+app = FastAPI(title="Research Agents", docs_url=None, redoc_url=None, openapi_url=None)
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 
 SESSIONS: dict[str, float] = {}                 # session id -> expiry
 _runs_by_ip: dict[str, deque] = defaultdict(deque)
+_failed_logins: dict[str, deque] = defaultdict(deque)
 CONCURRENCY = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT_RUNS", "3")))
 
 
@@ -90,12 +97,37 @@ async def no_store(request: Request, call_next):
     return response
 
 
+def _has_session(request: Request) -> bool:
+    exp = SESSIONS.get(request.cookies.get(COOKIE, ""))
+    return bool(exp and exp >= time.time())
+
+
 def _session(request: Request) -> str:
-    sid = request.cookies.get(COOKIE, "")
-    exp = SESSIONS.get(sid)
-    if not exp or exp < time.time():
+    if not _has_session(request):
         raise HTTPException(401, "No valid session")
-    return sid
+    return request.cookies[COOKIE]
+
+
+def _require_login(request: Request):
+    if LOGIN_REQUIRED:
+        _session(request)
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+
+
+def _credentials_ok(username: str, password: str) -> bool:
+    user_ok = secrets.compare_digest(_sha256(username), LOGIN_USER_SHA256)
+    pass_ok = secrets.compare_digest(_sha256(password), LOGIN_PASS_SHA256)  # always both: no timing hint
+    return user_ok and pass_ok
+
+
+def _login_blocked(ip: str) -> bool:
+    q, now = _failed_logins[ip], time.time()
+    while q and now - q[0] > FAILED_LOGIN_WINDOW:
+        q.popleft()
+    return len(q) >= MAX_FAILED_LOGINS
 
 
 def _client_ip(request: Request) -> str:
@@ -116,15 +148,25 @@ def _rate_limited(ip: str) -> bool:
 
 
 @app.get("/")
-async def index():
+async def index(request: Request):
+    if LOGIN_REQUIRED and not _has_session(request):
+        return RedirectResponse("/login", status_code=303)
     return FileResponse(ROOT / "static" / "index.html")
 
 
+@app.get("/login")
+async def login_page(request: Request):
+    if not LOGIN_REQUIRED or _has_session(request):
+        return RedirectResponse("/", status_code=303)
+    return FileResponse(ROOT / "static" / "login.html")
+
+
 @app.get("/api/config")
-async def config():
+async def config(request: Request):
+    _require_login(request)
     return {
         "mock": is_mock(),
-        "access_code_required": bool(ACCESS_CODE),
+        "login_required": LOGIN_REQUIRED,
         "agents": [{"key": a.key, "label": a.label, "emoji": a.emoji, "role": a.role,
                     "skills": a.skill_names} for a in AGENTS.values()],
         "models": MODELS, "model_plan": MODEL_PLAN, "skills": list_skills(),
@@ -132,13 +174,19 @@ async def config():
 
 
 class SessionIn(BaseModel):
-    code: str = ""
+    username: str = Field("", max_length=256)
+    password: str = Field("", max_length=256)
 
 
 @app.post("/api/session")
 async def create_session(body: SessionIn, request: Request, response: Response):
-    if ACCESS_CODE and not secrets.compare_digest(body.code, ACCESS_CODE):
-        raise HTTPException(401, "Wrong access code")
+    if LOGIN_REQUIRED:
+        ip = _client_ip(request)
+        if _login_blocked(ip):
+            raise HTTPException(429, "Příliš mnoho neúspěšných pokusů, zkus to později.")
+        if not _credentials_ok(body.username, body.password):
+            _failed_logins[ip].append(time.time())
+            raise HTTPException(401, "Neplatné přihlašovací údaje.")
     now = time.time()
     for sid in [s for s, exp in SESSIONS.items() if exp < now]:
         SESSIONS.pop(sid, None)
@@ -149,8 +197,16 @@ async def create_session(body: SessionIn, request: Request, response: Response):
     return {"ok": True}
 
 
+@app.post("/api/logout")
+async def logout(request: Request, response: Response):
+    SESSIONS.pop(request.cookies.get(COOKIE, ""), None)
+    response.delete_cookie(COOKIE)
+    return {"ok": True}
+
+
 @app.get("/api/skills/{name}")
-async def skill_file(name: str):
+async def skill_file(name: str, request: Request):
+    _require_login(request)
     if name not in {s["name"] for s in list_skills()}:
         raise HTTPException(404)
     return FileResponse(ROOT / "skills" / name / "SKILL.md", media_type="text/markdown; charset=utf-8")

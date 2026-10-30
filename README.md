@@ -3,14 +3,14 @@
 Uživatel zadá otázku a zpracují ji čtyři agenti s odlišnými rolemi. V UI je vidět, co který právě dělá,
 jaké nástroje volá, co si předávají a jak vypadá přesné `messages`, system prompt a tools každého z nich.
 
-**Živá verze:** _doplnit URL_ · **Bez API klíče** aplikace běží v mock režimu (stejný tvar odpovědí jako API,
-orchestrace i tool loop běží naostro).
+**Živá verze:** <https://demo.pavelpytlik.cz> (za přihlášením, údaje posílám zvlášť, v repu nejsou) ·
+**Bez API klíče** aplikace běží v mock režimu (stejný tvar odpovědí jako API, orchestrace i tool loop běží naostro).
 
 ```mermaid
 flowchart LR
     Q[Otázka] --> R[Router<br/>skill: question-decomposition]
     R -- podotázky + plán modelů --> S[Researcher<br/>web_search, fetch_page]
-    S -- findings + zdroje --> A[Analyst<br/>skill: source-evaluation<br/>evaluate_source, web_search]
+    S -- findings + zdroje --> A[Analyst<br/>skill: source-evaluation<br/>evaluate_source, find_in_source, web_search]
     A -. chybí → vrátit 1× .-> S
     A -- ověřená fakta + osnova + číslované zdroje --> W[Writer<br/>skill: plain-writing]
     W -. chybí → vrátit 1× .-> A
@@ -45,7 +45,7 @@ k rozhodnutí.
 | Viditelná práce s messages, system prompt a tools | inspektor: záložky *System prompt*, *Messages* (přesné pole poslané do API), *Tools* |
 | Vlastní Skill se SKILL.md, reálně použitý | `skills/source-evaluation` (Analyst, i jako tool `evaluate_source`), `skills/plain-writing` (Writer), `skills/question-decomposition` (Router) |
 | Jasný handoff mezi agenty | `app/orchestrator.py` + kontrakty v `app/contracts.py`, v UI události HND a RET v #PRŮBĚH |
-| Agent s nástrojem, který opravdu volá | Researcher: `web_search` (server tool Anthropic) + `fetch_page` (náš klient); Analyst: `evaluate_source` + `web_search` |
+| Agent s nástrojem, který opravdu volá | Researcher: `web_search` (server tool Anthropic) + `fetch_page` (náš klient); Analyst: `evaluate_source` + `find_in_source` + `web_search` |
 | Orchestrace explicitně v kódu | sekvenční pipeline v `Pipeline.run()`, žádné předávání uvnitř jednoho promptu |
 
 ## Orchestrace a handoffy
@@ -53,20 +53,21 @@ k rozhodnutí.
 `app/orchestrator.py` je jediné místo, které posouvá data mezi agenty. Agenti spolu nemluví napřímo.
 
 1. **Router** (vždy nejlevnější model) určí náročnost `simple | moderate | complex`, cíl a 2–5 podotázek.
-   Podle náročnosti **kód** (tabulka `MODEL_PLAN` v `app/agents.py`) vybere model a rozpočet vyhledávání
-   pro další agenty:
+   Podle náročnosti **kód** (tabulka `MODEL_PLAN` v `app/agents.py`) vybere model, rozpočet vyhledávání
+   a limit zjištění pro další agenty:
 
-   | náročnost | Researcher | Analyst | Writer | web_search |
-   |---|---|---|---|---|
-   | simple | Haiku | Haiku | Haiku | 3 |
-   | moderate | Sonnet | Sonnet | Sonnet | 5 |
-   | complex | Sonnet | Opus | Opus | 8 |
+   | náročnost | Researcher | Analyst | Writer | web_search | zjištění |
+   |---|---|---|---|---|---|
+   | simple | Haiku | Haiku | Haiku | 2 | max. 6 |
+   | moderate | Sonnet | Sonnet | Sonnet | 5 | max. 12 |
+   | complex | Sonnet | Opus | Opus | 8 | bez limitu |
 
 2. **Researcher** hledá (`web_search`), čte stránky (`fetch_page`) a vrací `findings` se zdroji.
 3. **Analyst** ohodnotí každý zdroj skillem `source-evaluation`, ověří klíčová tvrzení a připraví osnovu.
+   Když citát nestačí, prohledá plný text zdroje přes `find_in_source`.
 4. **Writer** napíše odpověď skillem `plain-writing` a cituje číslované zdroje `[n]`.
-5. **Kontrola výstupu** v kódu: každá citace míří na existující zdroj, delší odstavce mají citaci,
-   je tam sekce „Co nevíme“.
+5. **Kontrola výstupu** v kódu: každá citace míří na existující zdroj, delší odstavce s tvrzeními mají citaci
+   (sekce „Co nevíme“ a „Co dál“ žádná tvrzení nenesou), je tam sekce „Co nevíme“.
 
 Každý handoff má dvě kontroly:
 
@@ -83,7 +84,7 @@ continue_partial | abort`), v UI v záložce **Validace**.
 | Stav | Kdy |
 |---|---|
 | `COMPLETED` | všechny handoffy prošly, Writer cituje jen fakta z ledgeru, kontrola výstupu prošla |
-| `PARTIAL` | po vyčerpání vrácení existuje podložená podmnožina; v UI jsou vypsané důvody |
+| `PARTIAL` | odpověď existuje, ale něco neprošlo: kontrakt po vyčerpání vrácení, selhané vrácení nebo závěrečná kontrola; v UI jsou vypsané důvody |
 | `INSUFFICIENT_EVIDENCE` | žádné podložené zjištění/fakt: běh se zastaví, Writer se nevolá, odpověď poctivě řekne, co chybí |
 | `FAILED` | technická chyba (API, nedokončený tah, refusal); odlišené od nedostatku důkazů |
 
@@ -123,7 +124,8 @@ prázdné `based_on`, ve finální odpovědi je nelze použít jako ověřený f
 Tři úrovně, které se nemíchají: **kvalita zdroje** (prior ze skillu), **podpora tvrzení** (citát podporuje
 tvrzení) a **nezávislé potvrzení** (různé weby, různé znění, ne dvě kopie jedné tiskové zprávy).
 
-1. Researcher u každého zjištění (`f1…`) dodá doslovný citát; `fetch_page` drží text stažené stránky na serveru.
+1. Researcher u každého zjištění (`f1…`) dodá doslovný citát; model vidí z každé stránky 6000 znaků, server
+   drží až 200 000 znaků pro kontrolu citátů a `find_in_source`.
 2. Kód hledá citát v textu (`exact | normalized | not_found | not_in_fetched_part | not_fetched`).
    `quote_verified` znamená jen „citát je v textu, který jsme stáhli“, ne že je pravdivý.
 3. Analyst vytvoří fakta (`F1…`) s `based_on` odkazy na zjištění a `verification_status`
@@ -141,10 +143,12 @@ vystavený jako nástroj, takže skill se opravdu volá, ne jen „čte“.
 
 - **`source-evaluation`** (Analyst): dvoufázové hodnocení. Nejdřív skript `scripts/score_source.py`
   (přes tool `evaluate_source`) dá deterministické skóre 0–100 a tier A–D podle typu domény, https a stáří.
-  Agent ho smí upravit nejvýš o ±15 s odůvodněním. Pak podle pravidel přidělí každému faktu jistotu
-  (`high` jen s jedním primárním A zdrojem nebo dvěma nezávislými B+). Tier se zobrazuje u zdrojů v odpovědi.
+  Stáří zdroje se počítá podle `temporal_sensitivity` tvrzení. Agent smí skóre upravit nejvýš o ±15 s odůvodněním.
+  Pak podle pravidel přidělí každému faktu jistotu (`high` jen s jedním primárním A zdrojem nebo dvěma
+  nezávislými B+). Tier se zobrazuje u zdrojů v odpovědi.
 - **`plain-writing`** (Writer): odpověď nejdřív, krátké věty, čísla s jednotkou a datem, citace u každého
-  faktu, oddělení faktů od odhadů, povinná sekce „Co nevíme“, zakázané vatové fráze, délka podle náročnosti.
+  faktu včetně tabulek, oddělení faktů od odhadů, povinná sekce „Co nevíme“, zakázané vatové fráze, délka a míra
+  nejistot podle náročnosti.
 - **`question-decomposition`** (Router): jak se ptá konzultant, než odpoví: jaké rozhodnutí uživatel dělá,
   co se dá změřit, jaké podotázky pokrýt.
 
@@ -176,7 +180,7 @@ cp .env.example .env            # bez ANTHROPIC_API_KEY běží mock režim
 set -a; . ./.env; set +a
 uvicorn app.main:app --reload --port 8000
 # http://localhost:8000
-pytest -q                       # 34 testů, běží offline (mock + scénáře T01–T18)
+pytest -q                       # 74 testů, běží offline (mock + scénáře T01–T18)
 ```
 
 Nasazení je v příloze na konci.
@@ -184,14 +188,16 @@ Nasazení je v příloze na konci.
 ## Bezpečnost a náklady
 
 - Klíč jen v prostředí (`.env` / `/etc/research-agents.env`), nikdy v repu.
-- Přístupový kód jde jen v těle `POST /api/session` → `HttpOnly`, `SameSite=Lax` cookie (Secure na HTTPS).
+- S `LOGIN_USER_SHA256` a `LOGIN_PASS_SHA256` je celá aplikace za přihlašovací obrazovkou: bez session odpovídá
+  jen `/login` a `/static`. Server drží pouze SHA-256 hashe, po 10 chybných pokusech z IP se přihlášení na 15 minut
+  zablokuje. Údaje jdou jen v těle `POST /api/session` → `HttpOnly`, `SameSite=Lax` cookie (Secure na HTTPS).
   Otázka jde v těle `POST /api/jobs`; URL streamu nese jen id jobu. Trace i události vidí jen session,
   která běh spustila. API odpovědi mají `Cache-Control: no-store`.
 - Job běží dál i při odpojení prohlížeče; stream se obnoví a přehraje od `Last-Event-ID`.
 - Limit `RUNS_PER_HOUR` na IP (za proxy `TRUST_PROXY=1`), `MAX_CONCURRENT_RUNS`, otázka max. 500 znaků.
 - `fetch_page`: jen porty 80/443, každý hop přesměrování se znovu ověří, DNS se přeloží jednou a spojení
   jde na **ověřenou IP** (Host hlavička + TLS SNI pro původní jméno), takže DNS rebinding nepomůže;
-  max. 2 MB, max. 6000 znaků textu. Obsah webu je označený jako nedůvěryhodný a prompty zakazují
+  max. 2 MB, model vidí max. 6000 znaků textu. Obsah webu je označený jako nedůvěryhodný a prompty zakazují
   plnit instrukce z něj (prompt injection).
 - Volání API: retry s backoffem na 429 / 529 / 5xx (respektuje `retry-after`), timeout 600 s na dlouhé tahy s vyhledáváním.
 - Když agent nevrátí platný JSON, dostane jeden opravný tah se zprávou o chybě; teprve pak běh skončí chybou.
@@ -201,10 +207,20 @@ Nasazení je v příloze na konci.
 
 ## Co je a není ověřené
 
-- 56 offline testů včetně scénářů z review (stavy, `max_tokens`, paralelní tool_use, citace vs. podpora,
-  nezávislost, SSRF a rebinding, session a replay, snímky requestů, nevykonaný skill).
+- 74 offline testů včetně scénářů z review (stavy, `max_tokens`, paralelní tool_use, citace vs. podpora,
+  nezávislost, SSRF a rebinding, session a replay, snímky requestů, nevykonaný skill, přihlášení, doplňující otázky).
 - Mock režim projde UI end-to-end (session → job → SSE → odpověď s důkazy).
-- **Živý běh proti Claude API:** _doplnit po nasazení (datum, dotaz, odkaz na redigovaný trace v `samples/`)._
+- **Živé běhy proti Claude API** (30. 10. 2026, cena je odhad z `usage`):
+
+  | Dotaz | Náročnost | Stav | Čas | Cena |
+  |---|---|---|---|---|
+  | Jak funguje spalovací motor? | simple | `COMPLETED` | 62 s | 0,03 USD |
+  | Minimální mzda 2026 + doplňující „o kolik se zvýšila?“ | simple + doplňující | `COMPLETED` 2× | 47 + 84 s | 0,03 + 0,23 USD |
+  | Platy učitelů proti průměrné mzdě | moderate | `PARTIAL`: odstavec bez citace, kontrola to správně zachytila | 105 s | 0,35 USD |
+  | Vyplatí se tepelné čerpadlo? | complex | `PARTIAL`: sekce „Co dál“, kontrola pak upravena | 503 s | 1,97 USD |
+
+  Běhy šly přes lokální UI nebo přímo přes `Pipeline`. Běh `complex` předchází kalibraci podle složitosti.
+  Stejná pipeline běžela i na produkčním serveru (Python 3.11, `COMPLETED`, 42 s, 0,03 USD).
 - Hranice: prior skóre zdroje je heuristika z URL; `quote_verified` neověřuje pravdivost; ochrana proti
   prompt injection je instrukční, ne garantovaná.
 
@@ -212,7 +228,7 @@ Nasazení je v příloze na konci.
 
 Aplikaci jsem stavěl s Claude jako kódovacím agentem. Já jsem určil architekturu (sekvenční pipeline
 s kontrolovanými handoffy, router na výběr modelu, skills jako instrukce i nástroj), pravidla skills
-a kontrakty, a ověřoval jsem výsledek testy a během v mock režimu. Claude psal většinu kódu.
+a kontrakty, a ověřoval jsem výsledek testy, během v mock režimu a živými běhy. Claude psal většinu kódu.
 
 ## Co by bylo dál
 
@@ -223,7 +239,9 @@ a kontrakty, a ověřoval jsem výsledek testy a během v mock režimu. Claude p
 ## Příloha: nasazení
 
 - Docker: `docker build -t research-agents . && docker run -p 8000:8000 --env-file .env research-agents`
-- Server: `deploy/research-agents.service` (systemd) a `deploy/Caddyfile.snippet`
+- GCP VM: `deploy/deploy.sh` nasadí pracovní strom přes IAP (systemd `deploy/research-agents.service`, nginx
+  `deploy/nginx-research-agents.conf`). Tajemství jsou jen v `/etc/research-agents.env`, skript na ně nesahá.
+- Server s Caddy: `deploy/Caddyfile.snippet`
   (`flush_interval -1`, aby SSE události šly hned). Za reverzní proxy nastav `TRUST_PROXY=1`.
-- Proměnné: `ANTHROPIC_API_KEY`, `ACCESS_CODE`, `RUNS_PER_HOUR`, `MAX_CONCURRENT_RUNS`, `MAX_RETURNS`, `MAX_TOKENS`, `MAX_TOKENS_RETRY`,
+- Proměnné: `ANTHROPIC_API_KEY`, `LOGIN_USER_SHA256`, `LOGIN_PASS_SHA256`, `RUNS_PER_HOUR`, `MAX_CONCURRENT_RUNS`, `MAX_RETURNS`, `MAX_TOKENS`, `MAX_TOKENS_RETRY`,
   `MODEL_FAST|BALANCED|STRONG`, `PRICE_FAST|BALANCED|STRONG="in,out,cache_read"` (USD / 1M tokenů), `PRICE_WEB_SEARCH`.

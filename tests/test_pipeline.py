@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import socket
@@ -414,7 +415,7 @@ def test_api_follow_up_inherits_the_parent_and_stays_in_its_session(app_client):
     c, _ = app_client
     from app import main
     from fastapi.testclient import TestClient
-    assert c.post("/api/session", json={"code": "s3cret"}).status_code == 200
+    assert c.post("/api/session", json=LOGIN).status_code == 200
     first = c.post("/api/jobs", json={"question": "Jaký je stav AI v Evropě?"}).json()["job_id"]
     assert c.post("/api/jobs", json={"question": "A co dál?", "parent_id": first}).status_code == 409  # still running
     with c.stream("GET", f"/api/jobs/{first}/events") as s:
@@ -425,7 +426,7 @@ def test_api_follow_up_inherits_the_parent_and_stays_in_its_session(app_client):
         list(s.iter_lines())
     assert len(main.JOBS[next_id].memory["turns"]) == 2
     other = TestClient(main.app)
-    assert other.post("/api/session", json={"code": "s3cret"}).status_code == 200
+    assert other.post("/api/session", json=LOGIN).status_code == 200
     assert other.post("/api/jobs", json={"question": "A co dál?", "parent_id": first}).status_code == 404
     assert c.post("/api/jobs", json={"question": "A co dál?", "parent_id": "neexistuje"}).status_code == 404
 
@@ -529,6 +530,47 @@ def test_simple_questions_get_less_work():
     assert "<complexity>simple</complexity>" in first_user(client.calls, "analyst")
     plan = next(e for e in events if e["type"] == "handoff")["payload"]["model_plan"]
     assert set(plan) == {"researcher", "analyst", "writer"}
+
+
+def test_login_gate_serves_nothing_without_a_session(app_client):
+    c, _ = app_client
+    r = c.get("/", follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/login"
+    assert "password" in c.get("/login").text
+    for url in ("/api/config", "/api/skills/plain-writing", "/api/runs/x"):
+        assert c.get(url).status_code == 401, url
+    for url in ("/docs", "/redoc", "/openapi.json"):
+        assert c.get(url).status_code == 404, url
+    assert c.post("/api/jobs", json={"question": "Jaký je stav AI?"}).status_code == 401
+
+
+def test_login_needs_both_values_and_opens_the_app(app_client):
+    c, _ = app_client
+    assert c.post("/api/session", json={"username": LOGIN["username"], "password": "x"}).status_code == 401
+    assert c.post("/api/session", json={"username": "x", "password": LOGIN["password"]}).status_code == 401
+    assert c.post("/api/session", json={}).status_code == 401
+    assert c.post("/api/session", json=LOGIN).status_code == 200
+    assert c.get("/api/config").json()["login_required"] is True
+    assert "RESEARCH AGENTS" in c.get("/").text
+    assert c.get("/login", follow_redirects=False).status_code == 303
+    assert c.post("/api/logout").status_code == 200
+    assert c.get("/api/config").status_code == 401
+
+
+def test_repeated_failures_block_even_the_right_password(app_client):
+    c, _ = app_client
+    from app import main
+    for _ in range(main.MAX_FAILED_LOGINS):
+        assert c.post("/api/session", json={**LOGIN, "password": "x"}).status_code == 401
+    assert c.post("/api/session", json=LOGIN).status_code == 429
+
+
+def test_one_missing_hash_locks_the_app_instead_of_opening_it(app_client, monkeypatch):
+    c, _ = app_client
+    from app import main
+    monkeypatch.setattr(main, "LOGIN_PASS_SHA256", "")
+    assert c.post("/api/session", json=LOGIN).status_code == 401
+    assert c.post("/api/session", json={"username": LOGIN["username"]}).status_code == 401
 
 
 def test_T05_max_turns_with_pause_turn_fails():
@@ -718,12 +760,18 @@ def test_T14_dns_rebinding_mixed_answers_rejected_and_ip_pinned(monkeypatch):
 
 
 # ---------------------------------------------------------------- T15-T18 app + observability
+LOGIN = {"username": "tester", "password": "s3cret"}
+
+
 @pytest.fixture()
 def app_client(monkeypatch, tmp_path):
     monkeypatch.setenv("LOG_DIR", str(tmp_path))
     import importlib
     from app import main
-    monkeypatch.setattr(main, "ACCESS_CODE", "s3cret")
+    monkeypatch.setattr(main, "LOGIN_USER_SHA256", hashlib.sha256(LOGIN["username"].encode()).hexdigest())
+    monkeypatch.setattr(main, "LOGIN_PASS_SHA256", hashlib.sha256(LOGIN["password"].encode()).hexdigest())
+    monkeypatch.setattr(main, "LOGIN_REQUIRED", True)
+    main._failed_logins.clear()
     monkeypatch.setattr(main, "LOG_DIR", tmp_path)
     from fastapi.testclient import TestClient
     with TestClient(main.app) as c:
@@ -733,12 +781,12 @@ def app_client(monkeypatch, tmp_path):
 def test_T15_runs_and_events_need_the_owner_session(app_client):
     c, _ = app_client
     assert c.get("/api/runs/whatever").status_code == 401
-    assert c.post("/api/session", json={"code": "wrong"}).status_code == 401
+    assert c.post("/api/session", json={**LOGIN, "password": "wrong"}).status_code == 401
 
 
 def test_T16_code_never_in_urls_or_logs_and_events_replay(app_client):
     c, logdir = app_client
-    r = c.post("/api/session", json={"code": "s3cret"})
+    r = c.post("/api/session", json=LOGIN)
     assert r.status_code == 200 and "ra_session" in r.cookies
     job = c.post("/api/jobs", json={"question": "Jaký je stav AI v Evropě?"}).json()["job_id"]
     urls = [f"/api/jobs/{job}/events"]

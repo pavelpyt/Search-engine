@@ -23,6 +23,7 @@
     <span id="mode" class="tag">…</span>
     <button id="howBtn" class="btn" type="button">JAK TO FUNGUJE</button>
     <button id="themeBtn" class="btn" type="button" aria-label="Přepnout motiv">DARK</button>
+    <button id="logoutBtn" class="btn hidden" type="button">ODHLÁSIT</button>
   </div>
 </header>
 
@@ -40,10 +41,6 @@
       </div>
     </div>
     <form id="ask" class="ask">
-      <div class="field code-field hidden" id="codeField">
-        <label class="lbl" for="code">PŘÍSTUPOVÝ KÓD</label>
-        <input id="code" type="password" autocomplete="off">
-      </div>
       <div class="field">
         <label class="lbl" for="q" id="qLabel">OTÁZKA</label>
         <textarea id="q" rows="2" maxlength="500" placeholder="Např. Jaký je stav zavádění AI ve středních firmách v ČR?" required></textarea>
