@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Research Agents</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/vendor/marked.min.js"></script>
+<script src="/static/vendor/purify.min.js"></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="logo">🧭🔎🧪✍️</span>
+    <div>
+      <h1>Research Agents</h1>
+      <p class="sub">Multi-agentní výzkumný asistent · Router → Researcher → Analyst → Writer</p>
+    </div>
+  </div>
+  <div class="top-right">
+    <span id="mode" class="badge">…</span>
+    <button id="howBtn" class="ghost">Jak to funguje</button>
+  </div>
+</header>
+
+<section class="pipeline" id="pipeline" aria-label="Agenti"></section>
+
+<main class="layout">
+  <section class="chat">
+    <div id="thread" class="thread">
+      <div class="empty" id="empty">
+        <p>Zeptej se na téma nebo otázku. Uvidíš, co který agent dělá, jaké nástroje volá a co si předává.</p>
+        <div class="examples" id="examples"></div>
+      </div>
+    </div>
+    <form id="ask" class="ask">
+      <input id="code" type="password" placeholder="Přístupový kód" class="code hidden" autocomplete="off">
+      <textarea id="q" rows="2" maxlength="500" placeholder="Např. Jaký je stav zavádění AI ve středních firmách v ČR?" required></textarea>
+      <button id="send" type="submit">Spustit</button>
+    </form>
+  </section>
+
+  <aside class="side">
+    <div class="side-head">
+      <h2>Průběh</h2>
+      <a id="logLink" class="small hidden" target="_blank">Stáhnout log (JSON)</a>
+    </div>
+    <ol id="log" class="log"></ol>
+  </aside>
+</main>
+
+<div id="drawer" class="drawer hidden" role="dialog" aria-modal="true">
+  <div class="drawer-panel">
+    <div class="drawer-head">
+      <h2 id="drawerTitle">Agent</h2>
+      <button class="ghost" id="drawerClose" aria-label="Zavřít">✕</button>
+    </div>
+    <nav class="tabs" id="tabs"></nav>
+    <div id="drawerBody" class="drawer-body"></div>
+  </div>
+</div>
+
+<div id="how" class="drawer hidden" role="dialog" aria-modal="true">
+  <div class="drawer-panel">
+    <div class="drawer-head"><h2>Jak to funguje</h2><button class="ghost" data-close="how">✕</button></div>
+    <div class="drawer-body prose" id="howBody"></div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
