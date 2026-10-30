@@ -4,9 +4,10 @@ const $ = (s, el = document) => el.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const json = (o) => JSON.stringify(o, null, 2);
 const safeUrl = (u) => (/^https?:\/\//i.test(String(u || "")) ? u : "#");
-const usd = (n) => (n == null ? "" : n < 0.01 ? "< $0.01" : `$${n.toFixed(2)}`);
+const usd = (n) => (n == null ? "" : n < 0.01 ? "< 0,01 USD" : `${n.toFixed(2).replace(".", ",")} USD`);
+const TAGCLS = { idle: "", working: "hl", done: "good", returned: "warn", error: "bad" };
 
-const STATUS_CZ = { idle: "čeká", working: "pracuje", done: "hotovo", returned: "vráceno", error: "chyba" };
+const STATUS_CZ = { idle: "ČEKÁ", working: "BĚŽÍ", done: "HOTOVO", returned: "VRÁCENO", error: "CHYBA" };
 const EXAMPLES = [
   "Jaký je stav zavádění AI ve středních firmách v ČR a co jim nejvíc brání?",
   "What does the EU AI Act require from companies using chatbots in customer support?",
@@ -41,12 +42,12 @@ function renderPipeline() {
     card.dataset.agent = a.key;
     card.tabIndex = 0;
     card.innerHTML = `
-      <div class="card-head"><div class="avatar"><span class="emoji">${a.emoji}</span></div>
-        <div><div class="name">${esc(a.label)}</div><div class="role">${esc(a.role)}</div></div></div>
-      <div class="status">${STATUS_CZ.idle}</div>
+      <div class="card-head"><span class="name">${esc(a.label)}</span><span class="no">#0${i + 1}</span></div>
+      <div class="role">${esc(a.role)}</div>
+      <div><span class="tag status">${STATUS_CZ.idle}</span></div>
       <div class="step"></div>
-      <div class="meta">${a.skills.map((s) => `<span class="chip skill" title="Skill">📚 ${esc(s)}</span>`).join("")}
-        <span class="chip model hidden"></span><span class="chip tokens hidden"></span></div>`;
+      <div class="meta">${a.skills.map((s) => `<span class="tag" title="Skill">SKILL · ${esc(s)}</span>`).join("")}
+        <span class="tag model hidden"></span><span class="tag tokens hidden"></span></div>`;
     card.addEventListener("click", () => openInspector(a.key));
     card.addEventListener("keydown", (e) => e.key === "Enter" && openInspector(a.key));
     root.appendChild(card);
@@ -57,11 +58,13 @@ function updateCard(key) {
   const a = state.agents[key];
   const card = $(`.card[data-agent="${key}"]`);
   card.className = `card ${a.status}`;
-  $(".status", card).textContent = STATUS_CZ[a.status] || a.status;
+  const st = $(".status", card);
+  st.textContent = STATUS_CZ[a.status] || a.status;
+  st.className = `tag status ${TAGCLS[a.status] || ""}`;
   $(".step", card).textContent = a.step || "";
-  const m = $(".chip.model", card), t = $(".chip.tokens", card);
+  const m = $(".tag.model", card), t = $(".tag.tokens", card);
   if (a.model) { m.textContent = a.model.replace("claude-", ""); m.classList.remove("hidden"); }
-  if (a.usage) { t.textContent = `${a.usage.input_tokens + a.usage.output_tokens} tok · ${usd(a.usage.cost_usd)}`; t.classList.remove("hidden"); }
+  if (a.usage) { t.textContent = `${(a.usage.input_tokens + a.usage.output_tokens).toLocaleString("cs-CZ")} TOK · ${usd(a.usage.cost_usd)}`; t.classList.remove("hidden"); }
 }
 
 function setEdge(from, to, cls, label) {
@@ -82,12 +85,14 @@ function log(icon, html, cls = "") {
   ol.scrollTop = ol.scrollHeight;
 }
 const label = (k) => CONFIG.agents.find((a) => a.key === k)?.label || k;
-const emoji = (k) => CONFIG.agents.find((a) => a.key === k)?.emoji || "•";
+const code = (k) => ["", "RTR", "RSR", "ANL", "WRT"][CONFIG.agents.findIndex((a) => a.key === k) + 1] || "AGT";
 const short = (o, n = 120) => { const s = typeof o === "string" ? o : JSON.stringify(o); return s.length > n ? s.slice(0, n) + "…" : s; };
 
 // ---------- events ----------
-const STATUS_LABEL = { COMPLETED: "Dokončeno", PARTIAL: "Částečná odpověď", INSUFFICIENT_EVIDENCE: "Nedostatek důkazů", FAILED: "Selhalo" };
-const VSTATUS_CZ = { SUPPORTED: "podloženo", PARTIALLY_SUPPORTED: "částečně podloženo", CONTRADICTED: "v rozporu", UNSUPPORTED: "nepodloženo", NOT_CHECKED: "neověřeno" };
+const STATUS_LABEL = { COMPLETED: "HOTOVO", PARTIAL: "ČÁSTEČNĚ", INSUFFICIENT_EVIDENCE: "MÁLO DŮKAZŮ", FAILED: "CHYBA" };
+const STATUS_TAG = { COMPLETED: "good", PARTIAL: "warn", INSUFFICIENT_EVIDENCE: "warn", FAILED: "bad" };
+const VSTATUS_TAG = { SUPPORTED: "good", PARTIALLY_SUPPORTED: "warn", CONTRADICTED: "bad", UNSUPPORTED: "bad", NOT_CHECKED: "" };
+const VSTATUS_CZ = { SUPPORTED: "PODLOŽENO", PARTIALLY_SUPPORTED: "ČÁSTEČNĚ", CONTRADICTED: "V ROZPORU", UNSUPPORTED: "NEPODLOŽENO", NOT_CHECKED: "NEOVĚŘENO" };
 
 function onEvent(e) {
   const a = e.agent && state.agents[e.agent];
@@ -96,25 +101,25 @@ function onEvent(e) {
       state.runId = e.run_id;
       $("#logLink").href = `/api/runs/${e.run_id}`;
       $("#logLink").classList.remove("hidden");
-      log("▶", `Start: <b>${esc(e.question)}</b>`);
+      log("RUN", `Start: <b>${esc(e.question)}</b>`);
       break;
     case "agent_status":
       a.status = e.status; a.step = e.step; updateCard(e.agent);
-      if (e.status !== "done" || e.step) log(emoji(e.agent), `<b>${label(e.agent)}</b> · ${esc(STATUS_CZ[e.status])}${e.step ? ": " + esc(e.step) : ""}`,
+      if (e.status !== "done" || e.step) log(code(e.agent), `<b>${label(e.agent)}</b> · ${esc(STATUS_CZ[e.status])}${e.step ? ": " + esc(e.step) : ""}`,
         e.status === "returned" ? "warn" : "");
       break;
     case "skill_loaded":
       a.skills.set(e.skill, e);
-      log("📚", `${label(e.agent)} načetl skill <code>${esc(e.skill)}</code> v${esc(e.version)} do system promptu`);
+      log("SKL", `${label(e.agent)} načetl skill <code>${esc(e.skill)}</code> v${esc(e.version)} do system promptu`);
       break;
     case "skill_result":
       a.skillResult = e;
-      log(e.executed ? "🧩" : "⚠", `Skill <code>${esc(e.skill)}</code> ${e.executed ? "vykonán" : "NEBYL vykonán"}: <code>${esc(e.tool)}</code> ${e.invocations}× · pokrytí ${e.sources_total - e.not_scored.length}/${e.sources_total} zdrojů`, e.executed && !e.not_scored.length ? "" : "warn");
+      log("SKL", `Skill <code>${esc(e.skill)}</code> ${e.executed ? "vykonán" : "NEBYL vykonán"}: <code>${esc(e.tool)}</code> ${e.invocations}× · pokrytí ${e.sources_total - e.not_scored.length}/${e.sources_total} zdrojů`, e.executed && !e.not_scored.length ? "" : "warn");
       break;
     case "agent_request":
       a.model = e.model; updateCard(e.agent);
       a.invocations.push({ model: e.model, system: e.system, tools: e.tools, messages: e.messages, final: null, output: null });
-      log("🧠", `${label(e.agent)} → <code>${esc(e.model)}</code>, ${e.tools.length} tools`);
+      log("API", `${label(e.agent)} → <code>${esc(e.model)}</code>, ${e.tools.length} tools`);
       break;
     case "api_request":
       a.calls.push({ request: e, response: null });
@@ -129,7 +134,7 @@ function onEvent(e) {
       break;
     case "tool_call":
       a.tools.push({ ...e, result: null });
-      log(e.kind === "server" ? "🌐" : "🛠", `${label(e.agent)} volá <code>${esc(e.name)}</code> ${esc(short(e.input, 90))}`);
+      log(e.kind === "server" ? "WEB" : "TLS", `${label(e.agent)} volá <code>${esc(e.name)}</code> ${esc(short(e.input, 90))}`);
       break;
     case "tool_result": {
       const call = [...a.tools].reverse().find((t) => t.name === e.name && t.result === null);
@@ -137,7 +142,7 @@ function onEvent(e) {
       const r = e.result;
       const txt = r && r.results ? `${r.results.length} výsledků: ${r.results.slice(0, 2).map((x) => esc(x.title)).join(" · ")}`
         : r && r.error ? `chyba ${esc(r.error)}` : esc(short(r, 90));
-      log("📥", `<code>${esc(e.name)}</code> → ${txt}`, e.is_error ? "warn" : "");
+      log("RES", `<code>${esc(e.name)}</code> → ${txt}`, e.is_error ? "warn" : "");
       break;
     }
     case "usage":
@@ -149,36 +154,36 @@ function onEvent(e) {
     case "handoff": {
       state.agents[e.to].handoffsIn.push(e);
       const ok = e.contract_ok;
-      setEdge(e.from, e.to, ok ? "passed" : "returned", ok ? "✓" : "✗");
-      log("🤝", `Handoff <b>${label(e.from)} → ${label(e.to)}</b>: kontrakt ${ok ? "✓ splněn" : "✗ " + esc(e.missing.join("; "))}`, "handoff");
+      setEdge(e.from, e.to, ok ? "passed" : "returned", ok ? "OK" : "CHYBA");
+      log("HND", `Handoff <b>${label(e.from)} → ${label(e.to)}</b>: kontrakt ${ok ? "OK" : "CHYBA: " + esc(e.missing.join("; "))}`, ok ? "handoff" : "handoff warn");
       break;
     }
     case "validation_result": {
       state.validations.push(e);
-      const icon = { accepted: "✅", partial: "🟠", rejected: "↩" }[e.accepted] || "•";
       const who = e.code_check.ok ? (e.agent_check && e.agent_check.ok === false ? "přijímající agent" : "") : "kontrakt v kódu";
-      log(icon, `Validace <b>${esc(e.gate)}</b> (pokus ${e.attempt}): ${esc(e.accepted)} → ${esc(e.next_action)}${who ? ` · zjistil: ${who}` : ""}`,
+      log("VAL", `Validace <b>${esc(e.gate)}</b> (pokus ${e.attempt}): ${esc(e.accepted)} → ${esc(e.next_action)}${who ? ` · zjistil: ${who}` : ""}`,
         e.accepted === "accepted" ? "handoff" : "handoff warn");
-      if (e.accepted === "partial" && e.to !== "user") setEdge(e.from, e.to, "returned", "partial");
+      if (e.accepted === "partial" && e.to !== "user") setEdge(e.from, e.to, "returned", "ČÁST.");
       break;
     }
     case "handoff_return":
       setEdge(e.to, e.from, "returned", "");
-      log("↩", `<b>${label(e.from)}</b> vrací práci <b>${label(e.to)}</b>: ${esc((e.missing || []).join("; "))}`, "handoff warn");
+      log("RET", `<b>${label(e.from)}</b> vrací práci <b>${label(e.to)}</b>: ${esc((e.missing || []).join("; "))}`, "handoff warn");
       break;
     case "log":
-      log(e.level === "warn" ? "⚠" : "ℹ", esc(e.msg), e.level === "warn" ? "warn" : "");
+      log("LOG", esc(e.msg), e.level === "warn" ? "warn" : "");
       break;
     case "final":
       renderAnswer(e);
-      log(e.status === "COMPLETED" ? "✅" : e.status === "FAILED" ? "⛔" : "🟠",
-        `${esc(STATUS_LABEL[e.status] || e.status)} za ${e.duration_s} s · odhad ceny API ${usd(e.cost_usd)}`,
-        e.status === "COMPLETED" ? "" : "warn");
+      log("FIN", `${esc(STATUS_LABEL[e.status] || e.status)} za ${String(e.duration_s).replace(".", ",")} s · odhad ceny API ${usd(e.cost_usd)}`,
+        e.status === "COMPLETED" ? "good" : e.status === "FAILED" ? "err" : "warn");
+      $("#runTag").textContent = STATUS_LABEL[e.status] || e.status;
+      $("#runTag").className = `tag ${STATUS_TAG[e.status] || ""}`;
       break;
     case "error":
-      log("⛔", esc(e.msg), "err");
+      log("ERR", esc(e.msg), "err");
       for (const k in state.agents) if (state.agents[k].status === "working") { state.agents[k].status = "error"; updateCard(k); }
-      if (!state.runId && pending()) { pending().classList.add("error"); pending().textContent = "Chyba: " + e.msg; }
+      if (!state.runId && pending()) { pending().classList.add("error"); pending().textContent = "CHYBA · " + e.msg; }
       break;
     case "run_finished":
       state.finished = true;
@@ -191,15 +196,32 @@ function onEvent(e) {
 // ---------- answer ----------
 const pending = () => $(".msg.bot.pending");
 
+const okTag = (ok) => `<span class="tag ${ok ? "good" : "bad"}">${ok ? "OK" : "CHYBA"}</span>`;
+const num = (n) => (n == null ? "–" : String(n).replace(".", ","));
+
 function evidenceHtml(e) {
   if (!e.ledger || !e.ledger.length) return "";
-  const ev = e.evidence;
-  const head = ev ? `Důkazy: ${ev.evidence_support.supported}/${ev.evidence_support.of} použitých faktů podloženo ověřeným citátem · nezávislé potvrzení ${ev.independent_corroboration} · nepodložených v ledgeru ${ev.unsupported_in_ledger}` : "Důkazy";
-  const facts = e.ledger.map((f) => `<li class="fact"><div><span class="vstat ${f.verification_status}">${esc(VSTATUS_CZ[f.verification_status] || f.verification_status)}</span>
-      <b>${esc(f.fact_id)}</b> ${esc(f.statement)} <span class="note">jistota ${esc(f.confidence)}${f.independent_corroboration ? " · nezávisle potvrzeno" : ""}${f.limitations.length ? " · " + esc(f.limitations.join(", ")) : ""}</span></div>
-      <ul>${f.evidence.map((x) => `<li>${x.quote_verified ? "✓" : "✗"} <span class="note">${esc(x.quote_check)}</span> „${esc(short(x.quote, 220))}“ ${x.source_n ? `<a href="#src-${x.source_n}" class="cite">[${x.source_n}]</a>` : ""}</li>`).join("")}</ul></li>`).join("");
-  return `<details class="quality evidence"><summary>${head}</summary>
-    <p class="note">✓ = citát nalezen v textu stažené stránky (neznamená, že je pravdivý). Hodnocení zdroje (tier) je jen apriorní odhad podle URL.</p><ul class="facts">${facts}</ul></details>`;
+  const facts = e.ledger.map((f) => `<li class="rule"><div class="line"><span class="tag ${VSTATUS_TAG[f.verification_status] || ""}">${esc(VSTATUS_CZ[f.verification_status] || f.verification_status)}</span>
+      <b>${esc(f.fact_id)}</b> ${esc(f.statement)}</div>
+      <div class="why">JISTOTA ${esc(String(f.confidence).toUpperCase())}${f.independent_corroboration ? " · nezávisle potvrzeno" : ""}${f.limitations.length ? " · " + esc(f.limitations.join(", ")) : ""}</div>
+      <ul>${f.evidence.map((x) => `<li><span class="tag ${x.quote_verified ? "good" : "warn"}">${x.quote_verified ? "CITÁT OK" : "CITÁT ?"}</span> <span class="note">${esc(x.quote_check)}</span> „${esc(short(x.quote, 220))}“ ${x.source_n ? `<a href="#src-${x.source_n}" class="cite">[${x.source_n}]</a>` : ""}</li>`).join("")}</ul></li>`).join("");
+  return `<details class="evidence"><summary>#DŮKAZY · ${e.ledger.length} FAKTŮ</summary>
+    <p class="note">CITÁT OK = citát nalezen v textu stažené stránky (neznamená, že je pravdivý). Tier zdroje je jen apriorní odhad podle URL.</p><ul class="checks">${facts}</ul></details>`;
+}
+
+function statsHtml(e) {
+  const ev = e.evidence, ledger = e.ledger || [];
+  const verifiedQuotes = ledger.reduce((n, f) => n + f.evidence.filter((x) => x.quote_verified).length, 0);
+  const allQuotes = ledger.reduce((n, f) => n + f.evidence.length, 0);
+  const cell = (v, l, c = "") => `<div class="stat"><b class="${c}">${v}</b><span>${l}</span></div>`;
+  const sup = ev ? ev.evidence_support : null;
+  return `<div class="stats">
+    ${cell(ledger.length, "FAKTŮ")}
+    ${cell(`${verifiedQuotes}/${allQuotes}`, "OVĚŘENÉ CITÁTY", verifiedQuotes === allQuotes && allQuotes ? "g" : "w")}
+    ${cell(sup ? `${sup.supported}/${sup.of}` : "–", "PODLOŽENO", sup && sup.of && sup.supported === sup.of ? "g" : "w")}
+    ${cell(ev ? ev.independent_corroboration : "–", "NEZÁVISLE")}
+    ${cell((e.sources || []).length, "ZDROJŮ")}
+    ${cell(usd(e.cost_usd).replace(" USD", "") || "–", "CENA USD")}</div>`;
 }
 
 function renderAnswer(e) {
@@ -207,27 +229,44 @@ function renderAnswer(e) {
   el.className = "msg bot";
   const md = (e.answer_markdown || "").replace(/\[(\d+)\]/g, (m, n) => `<a class="cite" href="#src-${n}">[${n}]</a>`);
   const html = DOMPurify.sanitize(marked.parse(md), { ADD_ATTR: ["target"] });
-  const sources = (e.sources || []).map((s) => `<li id="src-${s.n}">${s.tier ? `<span class="tier ${s.tier}" title="prior score ${s.score ?? "?"}">${s.tier}</span>` : ""}
+  const tierTag = { A: "good", B: "strong", C: "warn", D: "bad" };
+  const sources = (e.sources || []).map((s) => `<li id="src-${s.n}"><span class="n">[${s.n}]</span>${s.tier ? `<span class="tag ${tierTag[s.tier] || ""}" title="apriorní skóre ${s.score ?? "?"}">TIER ${s.tier}</span>` : ""}
       <a href="${esc(safeUrl(s.url))}" target="_blank" rel="noopener noreferrer">${esc(s.title)}</a></li>`).join("");
   const q = e.quality;
-  const checks = q ? q.checks.map((c) => `<li>${c.ok ? "✅" : "⚠️"} ${esc(c.name)} <span class="note">${esc(c.detail)}</span></li>`).join("") : "";
-  const usage = Object.entries(e.usage || {}).map(([k, u]) => `${label(k)}: ${u.model.replace("claude-", "")} · ${u.input_tokens + u.output_tokens} tok · ${u.web_searches || 0} hledání · ${usd(u.cost_usd)}`).join(" · ");
+  const checks = q ? q.checks.map((c) => `<li class="rule"><div class="line">${okTag(c.ok)} ${esc(c.name)}</div>${c.detail ? `<div class="${c.ok ? "why" : "fix"}">${esc(c.detail)}</div>` : ""}</li>`).join("") : "";
+  const usage = Object.entries(e.usage || {}).map(([k, u]) => `${label(k).toUpperCase()} ${u.model.replace("claude-", "")} · ${(u.input_tokens + u.output_tokens).toLocaleString("cs-CZ")} tok · ${u.web_searches || 0} hledání · ${usd(u.cost_usd)}`).join("<br>");
   const reasons = (e.status_reasons || []).length ? `<ul class="reasons">${e.status_reasons.map((r) => `<li>${esc(r)}</li>`).join("")}</ul>` : "";
-  el.innerHTML = `<div class="runstatus ${e.status}"><b>${esc(STATUS_LABEL[e.status] || e.status)}</b>${reasons}</div>
+  el.innerHTML = `<div class="runhead"><span class="tag ${STATUS_TAG[e.status] || ""}">${esc(STATUS_LABEL[e.status] || e.status)}</span>
+      <span class="note">SLOŽITOST ${esc(String(e.complexity || "–").toUpperCase())} · ${num(e.duration_s)} s</span></div>${reasons}
+    ${statsHtml(e)}
     ${html ? `<div class="prose">${html}</div>` : ""}
     ${evidenceHtml(e)}
-    ${sources ? `<div class="sources"><b>Zdroje</b> <span class="note">(tier A–D = apriorní skóre ze skillu source-evaluation)</span><ol>${sources}</ol></div>` : ""}
-    ${q ? `<details class="quality" ${q.passed ? "" : "open"}><summary>Mechanická kontrola citací: ${q.passed ? "✓ prošla" : "⚠ našla problémy"} · ${q.words} slov · citováno ${q.cited.length}/${(e.sources || []).length} zdrojů</summary><p class="note">Ověřuje jen formu (citace míří na zdroj, sekce Co nevíme), ne pravdivost.</p><ul>${checks}</ul></details>` : ""}
-    <div class="runmeta">Složitost: <b>${esc(e.complexity || "–")}</b> · ${e.duration_s} s · odhad ceny API <b>${usd(e.cost_usd)}</b> <span class="note">(odhad z ceníku v .env)</span><br>${esc(usage)}</div>`;
+    ${sources ? `<div class="sources"><h3>#ZDROJE</h3><p class="note">Tier A–D = apriorní skóre ze skillu source-evaluation.</p><ol>${sources}</ol></div>` : ""}
+    ${q ? `<details ${q.passed ? "" : "open"}><summary>#KONTROLA CITACÍ · ${q.passed ? "OK" : "POZOR"} · ${q.words} SLOV · CITOVÁNO ${q.cited.length}/${(e.sources || []).length}</summary><p class="note">Ověřuje jen formu (citace míří na zdroj, sekce Co nevíme), ne pravdivost.</p><ul class="checks">${checks}</ul></details>` : ""}
+    <div class="runmeta">ODHAD CENY API ${usd(e.cost_usd)} (z ceníku v .env)<br>${esc(usage).replace(/&lt;br&gt;/g, "<br>")}</div>`;
+}
+
+function setupTheme() {
+  const btn = $("#themeBtn");
+  const current = () => document.documentElement.dataset.theme || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  const paint = () => { btn.textContent = current() === "dark" ? "LIGHT" : "DARK"; };
+  btn.addEventListener("click", () => {
+    const next = current() === "dark" ? "light" : "dark";
+    document.documentElement.dataset.theme = next;
+    try { localStorage.setItem("ui:theme", next); } catch (err) { /* private mode */ }
+    paint();
+  });
+  matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", paint);
+  paint();
 }
 
 // ---------- inspector ----------
 let inspectorKey = null;
-const TABS = [["system", "System prompt"], ["calls", "API volání"], ["messages", "Finální konverzace"], ["tools", "Tools"], ["output", "Výstup"], ["validation", "Validace"], ["handoff", "Handoff in"], ["skill", "Skill"]];
+const TABS = [["system", "#SYSTEM"], ["calls", "#API VOLÁNÍ"], ["messages", "#KONVERZACE"], ["tools", "#TOOLS"], ["output", "#VÝSTUP"], ["validation", "#VALIDACE"], ["handoff", "#HANDOFF IN"], ["skill", "#SKILL"]];
 
 function openInspector(key, tab = "calls") {
   inspectorKey = key;
-  $("#drawerTitle").textContent = `${emoji(key)} ${label(key)}`;
+  $("#drawerTitle").textContent = `#${label(key).toUpperCase()}`;
   $("#tabs").innerHTML = TABS.map(([k, l]) => `<button data-tab="${k}">${l}</button>`).join("");
   $("#tabs").querySelectorAll("button").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.tab)));
   $("#drawer").classList.remove("hidden");
@@ -250,8 +289,8 @@ const msgsHtml = (msgs) => msgs.map((m) => `<div class="msgblock"><div class="ro
 function validationHtml(v) {
   const ac = v.agent_check;
   return `<div class="msgblock"><div class="role">${esc(v.gate)} · pokus ${v.attempt} · ${esc(v.accepted)} → ${esc(v.next_action)}</div>
-    <ul><li>${v.code_check.ok ? "✅" : "❌"} Kontrakt v kódu ${v.code_check.missing.length ? ": " + esc(v.code_check.missing.join("; ")) : ""}</li>
-    <li>${ac ? (ac.ok === false ? "❌" : "✅") : "–"} Kontrola přijímajícím agentem ${ac ? (ac.missing && ac.missing.length ? ": " + esc(ac.missing.join("; ")) : "") : "(neběžela, kontrakt už selhal)"}</li></ul>
+    <ul class="checks"><li class="rule"><div class="line">${okTag(v.code_check.ok)} Kontrakt v kódu</div>${v.code_check.missing.length ? `<div class="fix">${esc(v.code_check.missing.join("; "))}</div>` : ""}</li>
+    <li class="rule"><div class="line">${ac ? okTag(ac.ok !== false) : `<span class="tag">–</span>`} Kontrola přijímajícím agentem</div>${ac ? (ac.missing && ac.missing.length ? `<div class="fix">${esc(ac.missing.join("; "))}</div>` : "") : `<div class="why">Neběžela, kontrakt už selhal.</div>`}</li></ul>
     ${v.evidence ? `<pre>${esc(json(v.evidence))}</pre>` : ""}</div>`;
 }
 
@@ -279,7 +318,7 @@ async function showTab(tab) {
       : `<p class="note">Pro tohoto agenta zatím žádná validace.</p>`;
   }
   if (tab === "handoff") body.innerHTML = a.handoffsIn.length ? a.handoffsIn.map((h) =>
-    `<div class="msgblock"><div class="role">${label(h.from)} → ${label(h.to)} · kontrakt ${h.contract_ok ? "✓" : "✗ " + esc(h.missing.join("; "))}</div><pre>${esc(json(h.payload))}</pre></div>`).join("")
+    `<div class="msgblock"><div class="role">${label(h.from)} → ${label(h.to)} · kontrakt ${h.contract_ok ? "OK" : "CHYBA: " + esc(h.missing.join("; "))}</div><pre>${esc(json(h.payload))}</pre></div>`).join("")
     : `<p class="note">Router dostává přímo otázku uživatele.</p>`;
   if (tab === "skill") {
     const names = CONFIG.agents.find((x) => x.key === inspectorKey).skills;
@@ -288,7 +327,7 @@ async function showTab(tab) {
     const texts = await Promise.all(names.map((n) => fetch(`/api/skills/${n}`).then((r) => r.text())));
     body.innerHTML = (sr ? `<p><b>Vykonání:</b> <code>${esc(sr.tool)}</code> ${sr.invocations}× · pokrytí ${sr.sources_total - sr.not_scored.length}/${sr.sources_total} zdrojů${sr.not_scored.length ? " · chybí: " + esc(sr.not_scored.join(", ")) : ""}</p>`
       : `<p class="note">Skill je načtený do system promptu${a?.skills.size ? "" : " (agent zatím neběžel)"}; vykonání skriptu se hlásí zvlášť.</p>`) +
-      texts.map((t, i) => `<h3>📚 ${esc(names[i])} — SKILL.md</h3><pre>${esc(t)}</pre>`).join("");
+      texts.map((t, i) => `<h3>#${esc(names[i])} · SKILL.md</h3><pre>${esc(t)}</pre>`).join("");
   }
 }
 
@@ -308,10 +347,11 @@ async function start(question) {
   state = freshState();
   renderPipeline();
   $("#log").innerHTML = "";
+  $("#runTag").textContent = "BĚŽÍ"; $("#runTag").className = "tag hl";
   $("#empty")?.remove();
   $("#send").disabled = true;
   const thread = $("#thread");
-  thread.insertAdjacentHTML("beforeend", `<div class="msg user">${esc(question)}</div><div class="msg bot pending">Agenti pracují… sleduj karty nahoře a průběh vpravo.</div>`);
+  thread.insertAdjacentHTML("beforeend", `<div class="msg user">${esc(question)}</div><div class="msg bot pending">BĚŽÍ · agenti pracují, sleduj karty nahoře a #PRŮBĚH.</div>`);
   thread.scrollTop = thread.scrollHeight;
   const fail = (msg) => { onEvent({ type: "error", msg }); $("#send").disabled = false; };
   if (!(await ensureSession())) return fail("Špatný přístupový kód.");
@@ -325,7 +365,7 @@ async function start(question) {
   source.onerror = () => {
     if (state.finished) return source.close();
     state.errors += 1;  // the browser reconnects by itself and resumes from Last-Event-ID
-    if (state.errors === 1) log("⚠", "Spojení přerušeno, obnovuji a navazuji tam, kde jsem skončil…", "warn");
+    if (state.errors === 1) log("NET", "Spojení přerušeno, obnovuji a navazuji tam, kde jsem skončil…", "warn");
     if (state.errors > 6) { source.close(); fail("Spojení se serverem se nepodařilo obnovit. Běh pokračuje na serveru; log najdeš přes odkaz nahoře."); }
   };
 }
@@ -337,23 +377,24 @@ function renderHow() {
     <p><b>Sekvenční pipeline v kódu</b> (<code>app/orchestrator.py</code>): Router → Researcher → Analyst → Writer → kontrola výstupu.
     Agenti spolu nemluví napřímo; data mezi nimi předává jen orchestrátor.</p>
     <p><b>Handoff:</b> každý agent vrací JSON. Orchestrátor ho zkontroluje proti kontraktu (<code>app/contracts.py</code>) a přijímající agent
-    navíc dělá vlastní <code>handoff_check</code>. Když něco chybí, práce se jednou vrátí zpět (↩ v průběhu).</p>
+    navíc dělá vlastní <code>handoff_check</code>. Když něco chybí, práce se jednou vrátí zpět (RET v #PRŮBĚH).</p>
     <p><b>Router</b> (vždy ${esc(CONFIG.models.fast)}) určí složitost; kód podle ní vybere modely a počet vyhledávání:</p>
     <table><tr><th>složitost</th><th>Researcher</th><th>Analyst</th><th>Writer</th><th>hledání</th></tr>${rows}</table>
     <p><b>Nástroje:</b> Researcher – <code>web_search</code> (server tool Anthropic) a <code>fetch_page</code> (náš klient, trafilatura).
     Analyst – <code>evaluate_source</code> (skript skillu) a omezený <code>web_search</code> na ověření. Writer – bez nástrojů.</p>
     <p><b>Skills:</b></p><ul>${CONFIG.skills.map((s) => `<li><code>${esc(s.name)}</code> – ${esc(s.description)}</li>`).join("")}</ul>
-    <p><b>Výsledek</b> má stav: <i>Dokončeno</i>, <i>Částečná odpověď</i>, <i>Nedostatek důkazů</i> nebo <i>Selhalo</i>. Po vyčerpání vrácení se nikdy netváří jako hotový.</p>
-    <p><b>Důkazy:</b> každé zjištění má doslovný citát; kód ho hledá v textu stažené stránky (✓/✗). Writer smí citovat jen fakta z ledgeru a kód kontroluje, že každé [n] patří k použitému faktu.</p>
+    <p><b>Výsledek</b> má stav: <span class="tag good">HOTOVO</span>, <span class="tag warn">ČÁSTEČNĚ</span>, <span class="tag warn">MÁLO DŮKAZŮ</span> nebo <span class="tag bad">CHYBA</span>. Po vyčerpání vrácení se nikdy netváří jako hotový.</p>
+    <p><b>Důkazy:</b> každé zjištění má doslovný citát; kód ho hledá v textu stažené stránky (CITÁT OK / CITÁT ?). Writer smí citovat jen fakta z ledgeru a kód kontroluje, že každé [n] patří k použitému faktu.</p>
     <p>Klikni na kartu agenta: system prompt, každé API volání zvlášť (request/response), finální konverzace, tools, výstup, validace předání a skill.</p>
     ${CONFIG.mock ? `<p class="note">Běží mock režim (bez API klíče): odpovědi mají stejný tvar jako API, orchestrace i tool loop běží naostro.</p>` : ""}`;
 }
 
 async function init() {
   CONFIG = await fetch("/api/config").then((r) => r.json());
-  $("#mode").textContent = CONFIG.mock ? "Mock režim" : "Live · Claude API";
-  $("#mode").classList.toggle("mock", CONFIG.mock);
-  if (CONFIG.access_code_required) $("#code").classList.remove("hidden");
+  $("#mode").textContent = CONFIG.mock ? "MOCK REŽIM" : "LIVE · CLAUDE API";
+  $("#mode").className = `tag ${CONFIG.mock ? "warn" : "good"}`;
+  setupTheme();
+  if (CONFIG.access_code_required) $("#codeField").classList.remove("hidden");
   state = freshState();
   renderPipeline();
   renderHow();

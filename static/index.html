@@ -4,6 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Research Agents</title>
+<script>(function(){try{var t=localStorage.getItem("ui:theme");if(t)document.documentElement.dataset.theme=t;}catch(e){}})();</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/style.css">
 <script src="/static/vendor/marked.min.js"></script>
 <script src="/static/vendor/purify.min.js"></script>
@@ -11,49 +15,57 @@
 <body>
 <header class="top">
   <div class="brand">
-    <span class="logo">🧭🔎🧪✍️</span>
-    <div>
-      <h1>Research Agents</h1>
-      <p class="sub">Multi-agentní výzkumný asistent · Router → Researcher → Analyst → Writer</p>
-    </div>
+    <h1>RESEARCH AGENTS</h1>
+    <span class="tag">ROUTER → RESEARCHER → ANALYST → WRITER</span>
+    <p class="sub">Multi-agentní výzkumný asistent</p>
   </div>
   <div class="top-right">
-    <span id="mode" class="badge">…</span>
-    <button id="howBtn" class="ghost">Jak to funguje</button>
+    <span id="mode" class="tag">…</span>
+    <button id="howBtn" class="btn" type="button">JAK TO FUNGUJE</button>
+    <button id="themeBtn" class="btn" type="button" aria-label="Přepnout motiv">DARK</button>
   </div>
 </header>
 
-<section class="pipeline" id="pipeline" aria-label="Agenti"></section>
+<section class="stage" aria-label="Agenti">
+  <div class="pipeline" id="pipeline"></div>
+</section>
 
 <main class="layout">
   <section class="chat">
+    <div class="sec-head"><h2>#ODPOVĚĎ</h2><span id="runTag" class="tag hidden"></span></div>
     <div id="thread" class="thread">
       <div class="empty" id="empty">
-        <p>Zeptej se na téma nebo otázku. Uvidíš, co který agent dělá, jaké nástroje volá a co si předává.</p>
+        <p>Zeptej se na téma nebo otázku. Uvidíš, co který agent dělá, jaké nástroje volá a co si předává. Klikni na kartu agenta pro detail.</p>
         <div class="examples" id="examples"></div>
       </div>
     </div>
     <form id="ask" class="ask">
-      <input id="code" type="password" placeholder="Přístupový kód" class="code hidden" autocomplete="off">
-      <textarea id="q" rows="2" maxlength="500" placeholder="Např. Jaký je stav zavádění AI ve středních firmách v ČR?" required></textarea>
-      <button id="send" type="submit">Spustit</button>
+      <div class="field code-field hidden" id="codeField">
+        <label class="lbl" for="code">PŘÍSTUPOVÝ KÓD</label>
+        <input id="code" type="password" autocomplete="off">
+      </div>
+      <div class="field">
+        <label class="lbl" for="q">OTÁZKA</label>
+        <textarea id="q" rows="2" maxlength="500" placeholder="Např. Jaký je stav zavádění AI ve středních firmách v ČR?" required></textarea>
+      </div>
+      <div class="actions"><button id="send" type="submit" class="btn primary">SPUSTIT VÝZKUM</button></div>
     </form>
   </section>
 
   <aside class="side">
-    <div class="side-head">
-      <h2>Průběh</h2>
-      <a id="logLink" class="small hidden" target="_blank">Stáhnout log (JSON)</a>
+    <div class="sec-head">
+      <h2>#PRŮBĚH</h2>
+      <a id="logLink" class="btn hidden" target="_blank">STÁHNOUT LOG</a>
     </div>
     <ol id="log" class="log"></ol>
   </aside>
 </main>
 
-<div id="drawer" class="drawer hidden" role="dialog" aria-modal="true">
+<div id="drawer" class="drawer hidden" role="dialog" aria-modal="true" aria-labelledby="drawerTitle">
   <div class="drawer-panel">
     <div class="drawer-head">
-      <h2 id="drawerTitle">Agent</h2>
-      <button class="ghost" id="drawerClose" aria-label="Zavřít">✕</button>
+      <h2 id="drawerTitle">AGENT</h2>
+      <button class="btn" id="drawerClose" type="button" aria-label="Zavřít">× ZAVŘÍT</button>
     </div>
     <nav class="tabs" id="tabs"></nav>
     <div id="drawerBody" class="drawer-body"></div>
@@ -62,7 +74,7 @@
 
 <div id="how" class="drawer hidden" role="dialog" aria-modal="true">
   <div class="drawer-panel">
-    <div class="drawer-head"><h2>Jak to funguje</h2><button class="ghost" data-close="how">✕</button></div>
+    <div class="drawer-head"><h2>#JAK TO FUNGUJE</h2><button class="btn" type="button" data-close="how">× ZAVŘÍT</button></div>
     <div class="drawer-body prose" id="howBody"></div>
   </div>
 </div>

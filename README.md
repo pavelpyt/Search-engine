@@ -8,11 +8,11 @@ orchestrace i tool loop běží naostro).
 
 ```mermaid
 flowchart LR
-    Q[Otázka] --> R[🧭 Router<br/>skill: question-decomposition]
-    R -- podotázky + plán modelů --> S[🔎 Researcher<br/>web_search, fetch_page]
-    S -- findings + zdroje --> A[🧪 Analyst<br/>skill: source-evaluation<br/>evaluate_source, web_search]
+    Q[Otázka] --> R[Router<br/>skill: question-decomposition]
+    R -- podotázky + plán modelů --> S[Researcher<br/>web_search, fetch_page]
+    S -- findings + zdroje --> A[Analyst<br/>skill: source-evaluation<br/>evaluate_source, web_search]
     A -. chybí → vrátit 1× .-> S
-    A -- ověřená fakta + osnova + číslované zdroje --> W[✍️ Writer<br/>skill: plain-writing]
+    A -- ověřená fakta + osnova + číslované zdroje --> W[Writer<br/>skill: plain-writing]
     W -. chybí → vrátit 1× .-> A
     W --> QC[Kontrola výstupu v kódu]
 ```
@@ -40,11 +40,11 @@ k rozhodnutí.
 | Požadavek | Kde |
 |---|---|
 | 3–4 subagenti s odlišnými rolemi | `app/agents.py`, system prompty v `prompts/*.md` |
-| UI ukazuje práci každého agenta, ne jen shrnutí | karty agentů, živý průběh, inspektor (klik na kartu) |
+| UI ukazuje práci každého agenta, ne jen shrnutí | karty agentů, živý průběh, inspektor (klik na kartu); vzhled DESKY: monospace, 1px linky, barva jen pro stav, světlý/tmavý motiv |
 | Claude API voláno napřímo, bez LangChainu | `app/llm.py` – `httpx` POST na `/v1/messages`, vlastní tool loop |
 | Viditelná práce s messages, system prompt a tools | inspektor: záložky *System prompt*, *Messages* (přesné pole poslané do API), *Tools* |
 | Vlastní Skill se SKILL.md, reálně použitý | `skills/source-evaluation` (Analyst, i jako tool `evaluate_source`), `skills/plain-writing` (Writer), `skills/question-decomposition` (Router) |
-| Jasný handoff mezi agenty | `app/orchestrator.py` + kontrakty v `app/contracts.py`, v UI události 🤝 a ↩ |
+| Jasný handoff mezi agenty | `app/orchestrator.py` + kontrakty v `app/contracts.py`, v UI události HND a RET v #PRŮBĚH |
 | Agent s nástrojem, který opravdu volá | Researcher: `web_search` (server tool Anthropic) + `fetch_page` (náš klient); Analyst: `evaluate_source` + `web_search` |
 | Orchestrace explicitně v kódu | sekvenční pipeline v `Pipeline.run()`, žádné předávání uvnitř jednoho promptu |
 
@@ -103,7 +103,7 @@ tvrzení) a **nezávislé potvrzení** (různé weby, různé znění, ne dvě k
 4. Kód z toho sestaví ledger: bez ověřeného citátu jistota max. `low`, `high` jen s ověřeným citátem
    a nezávislostí (nebo primárním zdrojem); nezávislost počítá kód z různých webů a různých citátů.
 5. Writer dostane jen podložená fakta, vrací `used_facts` a kód kontroluje, že každé `[n]` v odpovědi
-   patří k použitému faktu. V UI panel **Důkazy** ukazuje fakta, citáty a ✓/✗.
+   patří k použitému faktu. V UI panel **Důkazy** ukazuje fakta, citáty a stav CITÁT OK / CITÁT ?.
 
 ## Skills
 
