@@ -6,13 +6,15 @@ import socket
 os.environ["MOCK"] = "1"
 os.environ.setdefault("MOCK_FETCH", "1")
 
+import httpx
 import pytest
 
 from app import contracts as C
 from app import evidence as E
 from app import orchestrator as O
 from app import tools as T
-from app.llm import extract_json, run_agent
+from app.agents import MODELS, estimate_cost
+from app.llm import MAX_TOKENS, MAX_TOKENS_RETRY, MessagesClient, extract_json, run_agent
 from app.mock import MockClient
 from app.orchestrator import Pipeline
 from app.skills import list_skills, load_skill
@@ -164,6 +166,369 @@ def test_T04_max_tokens_with_valid_json_is_not_accepted():
     with pytest.raises(Exception, match="did not complete"):
         run(Pipeline(client, emit).call("router", "fast", "<question>q</question>"))
     assert client.calls["router"] == 2  # original + one repair, never accepted
+
+
+class Recording(MockClient):
+    """Replays `replies`, keeping a copy of what each request sent."""
+    def __init__(self, replies):
+        self.replies, self.sent = list(replies), []
+
+    async def create(self, **kw):
+        self.sent.append({"max_tokens": kw["max_tokens"], "messages": list(kw["messages"])})
+        return self.replies.pop(0)
+
+
+def test_cut_off_turn_runs_again_with_more_room_and_is_dropped():
+    cut = {"stop_reason": "max_tokens", "usage": {"input_tokens": 1, "output_tokens": 1}, "content": [
+        {"type": "text", "text": "```json\n{\"findings\": ["},
+        {"type": "tool_use", "id": "toolu_1", "name": "fetch_page", "input": {}}]}
+    client = Recording([cut, text_resp({"ok": True})])
+    _, emit = collect()
+    r = run(run_agent(client=client, agent="researcher", model="m", system="s", user_content="q",
+                      tools=[], client_tools={}, emit=emit))
+    assert r.stop_reason == "end_turn" and extract_json(r.text) == {"ok": True}
+    assert [c["max_tokens"] for c in client.sent] == [MAX_TOKENS, MAX_TOKENS_RETRY]
+    # The unanswered tool_use must not reach the API: that would be a 400.
+    assert client.sent[1]["messages"] == [{"role": "user", "content": "q"}]
+
+
+def test_cut_off_at_the_raised_limit_is_not_retried_again():
+    cut = text_resp("{", stop="max_tokens")
+    client = Recording([cut, cut])
+    _, emit = collect()
+    r = run(run_agent(client=client, agent="researcher", model="m", system="s", user_content="q",
+                      tools=[], client_tools={}, emit=emit))
+    assert r.stop_reason == "max_tokens" and len(client.sent) == 2
+
+
+def test_merge_research_keeps_earlier_findings():
+    prev = {"findings": [{"id": "f1", "claim": "a"}, {"id": "f2", "claim": "b"}], "gaps": ["x"], "sources": [1]}
+    merged = E.merge_research(prev, {"findings": [{"id": "f2", "claim": "b2"}, {"id": "f3", "claim": "c"}], "gaps": []})
+    assert [(f["id"], f["claim"]) for f in merged["findings"]] == [("f1", "a"), ("f2", "b2"), ("f3", "c")]
+    assert merged["gaps"] == [] and merged["sources"] == [1]
+    assert E.merge_research(prev, {})["gaps"] == ["x"]
+
+
+def test_return_asks_for_a_delta_and_merges_it():
+    seen = []
+
+    class Client(MockClient):
+        async def create(self, **kw):
+            if "AGENT: researcher" in kw["system"] and "<feedback" in kw["messages"][0]["content"]:
+                seen.append(kw["messages"][0]["content"])
+                if len(kw["messages"]) > 1:
+                    return text_resp({"findings": [{"id": "f4", "claim": "new", "source_url": T_URL, "quote": "q" * 20}]})
+            return await super().create(**kw)
+
+    T_URL = "https://www.oecd.org/x"
+    events, emit = collect()
+    r = run(Pipeline(Client(), emit).run("otazka?"))
+    assert r["status"] in {"COMPLETED", "PARTIAL"}
+    assert "do NOT repeat" in seen[0] and "<previous_research>" in seen[0]
+    assert '"quote":' not in seen[0].split("<previous_research>")[1]  # no need to resend quotes
+    last = [e for e in events if e["type"] == "handoff" and e["from"] == "researcher"][-1]
+    assert [f["id"] for f in last["payload"]["findings"]] == ["f1", "f2", "f3", "f4"]
+
+
+def test_failed_return_keeps_earlier_work_as_partial():
+    """A return that is cut off must not throw away research the analyst already graded."""
+    class Client(MockClient):
+        returns, analyst_calls = 0, 0
+
+        async def create(self, **kw):
+            if "AGENT: analyst" in kw["system"]:
+                Client.analyst_calls += 1
+            if "AGENT: researcher" in kw["system"] and "<feedback" in kw["messages"][0]["content"]:
+                Client.returns += 1
+                return text_resp("```json\n{\"findings\": [", stop="max_tokens")
+            return await super().create(**kw)
+
+    events, emit = collect()
+    r = run(Pipeline(Client(), emit).run("otazka?"))
+    assert r["status"] == "PARTIAL" and r["answer_markdown"].strip()
+    assert any("Return to researcher failed" in x for x in r["status_reasons"])
+    assert Client.returns == 2  # cut off, then cut off again at the raised limit
+    assert Client.analyst_calls == 2  # the analysis was not paid for a second time
+    assert not [e for e in events if e["type"] == "error"]
+
+
+def request_body(tools):
+    """Body MessagesClient really POSTs, without touching the network."""
+    bodies = []
+
+    class Http:
+        async def post(self, url, headers=None, json=None):
+            bodies.append(json)
+            return httpx.Response(200, json={"content": [], "stop_reason": "end_turn", "usage": {}})
+
+    client = MessagesClient("key")
+    client.http = Http()
+    run(client.create(model="m", system="s", messages=[{"role": "user", "content": "q"}], tools=tools))
+    return bodies[0]
+
+
+def test_only_tool_loops_use_the_prompt_cache():
+    assert request_body([T.FETCH_PAGE])["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control" not in request_body(None)  # one-shot call: a write would never be read
+
+
+def test_cost_prices_cache_reads_and_writes():
+    u = {"input_tokens": 1_000, "cache_read_input_tokens": 1_000_000, "cache_creation_input_tokens": 10_000,
+         "output_tokens": 1_000, "server_tool_use": {"web_search_requests": 2}}
+    # Sonnet tier: 0.002 fresh + 0.10 read + 0.025 write + 0.01 output + 0.02 searches
+    assert estimate_cost(MODELS["balanced"], u) == pytest.approx(0.157)
+    assert estimate_cost(MODELS["strong"], {"cache_read_input_tokens": 1_000_000}) == pytest.approx(0.20)
+
+
+def test_haiku_long_prompt_price_counts_cached_tokens():
+    short = {"input_tokens": 100, "cache_read_input_tokens": 99_900, "output_tokens": 1_000}
+    long = {**short, "cache_read_input_tokens": 99_901}
+    assert estimate_cost("claude-haiku-5-5", long) == pytest.approx(estimate_cost("claude-haiku-5-5", short) * 5, rel=1e-3)
+    assert estimate_cost("claude-sonnet-5-5", long) == pytest.approx(estimate_cost("claude-sonnet-5-5", short), rel=1e-3)
+
+
+def test_usage_adds_up_cache_fields_per_response():
+    reply = {"stop_reason": "end_turn", "content": [{"type": "text", "text": "{}"}],
+             "usage": {"input_tokens": 10, "cache_read_input_tokens": 900, "cache_creation_input_tokens": 90, "output_tokens": 5}}
+    _, emit = collect()
+    p = Pipeline(Recording([]), emit)
+
+    async def go():
+        r = await run_agent(client=Recording([reply]), agent="router", model="claude-sonnet-5-5", system="s",
+                            user_content="q", tools=[], client_tools={}, emit=emit)
+        await p.add_usage("router", "claude-sonnet-5-5", r.usage)
+        await p.add_usage("router", "claude-sonnet-5-5", r.usage)
+    run(go())
+    u = p.usage["router"]
+    assert (u["input_tokens"], u["cache_read_input_tokens"], u["cache_creation_input_tokens"]) == (20, 1800, 180)
+    assert u["cost_usd"] == round(2 * estimate_cost("claude-sonnet-5-5", reply["usage"]), 4)
+
+
+LONG = "Tato věta je dost dlouhá na to, aby ji kontrola citací považovala za delší odstavec, " * 2
+
+
+@pytest.mark.parametrize("heading", ["## Co dál", "## Co nevíme", "## Open questions", "### Next steps", "## Další kroky"])
+def test_sections_without_claims_need_no_citation(heading):
+    assert C.uncited_paragraphs(f"## Shrnutí\n\n{LONG}[1]\n\n{heading}\n\n1. {LONG}\n2. {LONG}\n") == 0
+
+
+def test_uncited_claim_in_the_body_still_fails():
+    assert C.uncited_paragraphs(f"## Co dál\n\n{LONG}\n\n## Data\n\n{LONG}\n") == 1
+    assert C.uncited_paragraphs(f"{LONG}\n\n## Data\n{LONG}[1]\n") == 1  # text before the first heading counts
+
+
+def test_body_after_an_exempt_section_is_checked_again():
+    assert C.uncited_paragraphs(f"## Co nevíme\n\n{LONG}\n\n## Závěr\n\n{LONG}\n") == 1
+
+
+# ---------------------------------------------------------------- follow-up questions
+QUOTE = "The relevant sentence from the page states the main finding clearly."
+MEMORY = {"turns": [{"question": "Vyplatí se tepelné čerpadlo?", "answer": "Většinou ano [1], záleží na domě [2]."}],
+          "findings": [{"id": "k1", "claim": "Cena 300 tis.", "source_url": "https://a.cz/1", "source_title": "A", "quote": QUOTE},
+                       {"id": "k2", "claim": "Dotace 180 tis.", "source_url": "https://b.cz/2", "source_title": "B", "quote": QUOTE + " Dotace."},
+                       {"id": "k3", "claim": "Mimo téma", "source_url": "https://c.cz/3", "source_title": "C", "quote": QUOTE}],
+          "docs": {"https://a.cz/1": {"text": QUOTE}, "https://b.cz/2": {"text": QUOTE + " Dotace."}}}
+
+
+def first_user(calls, agent):
+    return next(c["messages"][0]["content"] for c in calls if f"AGENT: {agent}" in c["system"])
+
+
+class Spy(MockClient):
+    """The mock pipeline, with the requests kept and the researcher optionally scripted."""
+    def __init__(self, researcher=None, router=None):
+        self.calls, self.researcher, self.router = [], researcher, router
+
+    async def create(self, **kw):
+        self.calls.append({"system": kw["system"], "messages": list(kw["messages"])})
+        if "AGENT: router" in kw["system"] and self.router:
+            return text_resp(self.router)
+        if "AGENT: researcher" in kw["system"] and self.researcher and "<feedback" not in kw["messages"][0]["content"]:
+            return text_resp(self.researcher)
+        return await super().create(**kw)
+
+
+ROUTED = {"complexity": "simple", "goal": "g", "language": "cs", "subquestions": ["a"],
+          "standalone_question": "Kolik stojí tepelné čerpadlo v roce 2026?"}
+
+
+def test_router_gets_the_conversation_and_agents_get_the_standalone_question():
+    client = Spy(router=ROUTED)
+    _, emit = collect()
+    r = run(Pipeline(client, emit, memory=MEMORY).run("A kolik to stojí?"))
+    router_in = first_user(client.calls, "router")
+    assert "<conversation>" in router_in and "<question>A kolik to stojí?</question>" in router_in
+    assert "[1]" not in router_in  # citation numbers of another run must not leak in
+    for agent in ("researcher", "analyst"):
+        assert "Kolik stojí tepelné čerpadlo v roce 2026?" in first_user(client.calls, agent)
+    assert "earlier_answers" in first_user(client.calls, "writer")
+    assert r["answer_markdown"]
+
+
+def test_first_question_ignores_a_standalone_rewrite():
+    client = Spy(router=ROUTED)
+    _, emit = collect()
+    run(Pipeline(client, emit).run("Vyplatí se tepelné čerpadlo?"))
+    router_in = first_user(client.calls, "router")
+    assert "<conversation>" not in router_in
+    assert "Vyplatí se tepelné čerpadlo?" in first_user(client.calls, "researcher")
+    assert "<known_findings>" not in first_user(client.calls, "researcher")
+
+
+def test_reused_findings_keep_their_quote_check_without_a_new_fetch():
+    client = Spy(router=ROUTED, researcher={"findings": [], "reuse": ["k1", "k2", "nonsense"], "gaps": []})
+    events, emit = collect()
+    p = Pipeline(client, emit, memory=MEMORY)
+    run(p.run("A kolik to stojí?"))
+    assert "<known_findings>" in first_user(client.calls, "researcher")
+    first = next(e for e in events if e["type"] == "handoff" and e["from"] == "researcher")
+    assert [(f["id"], f["quote_verified"]) for f in first["payload"]["findings"]] == [("k1", True), ("k2", True)]
+    assert "Mimo téma" not in json.dumps(first["payload"], ensure_ascii=False)
+    assert '"quote"' not in first_user(client.calls, "researcher").split("<known_findings>")[1]
+
+
+def test_memory_stays_bounded_and_ids_do_not_clash():
+    _, emit = collect()
+    memory = {"turns": [{"question": str(i), "answer": "x"} for i in range(5)],
+              "findings": [{"id": f"k{i}", "source_url": f"https://a.cz/{i}", "quote": "q"} for i in range(60)],
+              "docs": {}}
+    p = Pipeline(MockClient(), emit, memory=memory)
+    p.question = "nová"
+    p.findings = [{"id": "f1", "source_url": "https://a.cz/59", "quote": "q"}, {"id": "f2", "source_url": "https://n.cz", "quote": "z"}]
+    m = p.next_memory({"answer_markdown": "odpověď"})
+    assert [t["question"] for t in m["turns"]] == ["3", "4", "nová"]
+    assert len(m["findings"]) == O.MEMORY_FINDINGS
+    assert [f["id"] for f in m["findings"]] == [f"k{i}" for i in range(1, O.MEMORY_FINDINGS + 1)]
+    assert sum(f["source_url"] == "https://a.cz/59" for f in m["findings"]) == 1  # same quote kept once
+    assert m["findings"][-1]["source_url"] == "https://n.cz"
+
+
+def test_run_without_an_answer_adds_no_turn():
+    _, emit = collect()
+    p = Pipeline(MockClient(), emit, memory=MEMORY)
+    p.question = "x"
+    assert p.next_memory({"answer_markdown": ""})["turns"] == MEMORY["turns"]
+
+
+def test_api_follow_up_inherits_the_parent_and_stays_in_its_session(app_client):
+    c, _ = app_client
+    from app import main
+    from fastapi.testclient import TestClient
+    assert c.post("/api/session", json={"code": "s3cret"}).status_code == 200
+    first = c.post("/api/jobs", json={"question": "Jaký je stav AI v Evropě?"}).json()["job_id"]
+    assert c.post("/api/jobs", json={"question": "A co dál?", "parent_id": first}).status_code == 409  # still running
+    with c.stream("GET", f"/api/jobs/{first}/events") as s:
+        list(s.iter_lines())
+    assert main.JOBS[first].memory["turns"]
+    next_id = c.post("/api/jobs", json={"question": "A co dál?", "parent_id": first}).json()["job_id"]
+    with c.stream("GET", f"/api/jobs/{next_id}/events") as s:
+        list(s.iter_lines())
+    assert len(main.JOBS[next_id].memory["turns"]) == 2
+    other = TestClient(main.app)
+    assert other.post("/api/session", json={"code": "s3cret"}).status_code == 200
+    assert other.post("/api/jobs", json={"question": "A co dál?", "parent_id": first}).status_code == 404
+    assert c.post("/api/jobs", json={"question": "A co dál?", "parent_id": "neexistuje"}).status_code == 404
+
+
+# ---------------------------------------------------------------- evidence and calibration
+GOOD_FACTS = [{"id": "F1", "based_on": ["f1"], "verification_status": "SUPPORTED"},
+              {"id": "F2", "based_on": ["f1"], "verification_status": "SUPPORTED"}]
+ANALYSIS = {"source_scores": [{"url": "u"}], "outline": ["a"]}
+
+
+@pytest.mark.parametrize("status", ["UNSUPPORTED", "NOT_CHECKED", "unsupported"])
+def test_honest_verdict_needs_no_finding(status):
+    a = {**ANALYSIS, "verified_facts": [*GOOD_FACTS, {"id": "F3", "based_on": [], "verification_status": status}]}
+    assert C.check_analysis(a, {"f1"}) == []
+
+
+@pytest.mark.parametrize("status", ["SUPPORTED", "PARTIALLY_SUPPORTED", "CONTRADICTED"])
+def test_positive_verdict_still_needs_a_finding(status):
+    a = {**ANALYSIS, "verified_facts": [*GOOD_FACTS, {"id": "F3", "based_on": [], "verification_status": status}]}
+    assert any("F3" in m for m in C.check_analysis(a, {"f1"}))
+
+
+def test_unsupported_fact_cannot_be_used_as_verified():
+    ledger = E.build_ledger([], {"verified_facts": [{"id": "F1", "fact": "x", "based_on": [], "verification_status": "UNSUPPORTED"}]}, [])
+    assert ledger[0]["verification_status"] == "UNSUPPORTED"
+    ev = E.check_writer_evidence({"used_facts": ["F1"]}, ledger, "text")
+    assert ev["unsupported_facts_used"] == ["F1"] and not ev["ok"]
+
+
+PAGE = "Intro about engines. " * 400 + "Diesel engines then spray the fuel into the hot compressed air, causing it to ignite. Outro."
+
+
+def test_find_in_source_reaches_text_the_model_never_saw(monkeypatch):
+    async def fake_fetch(url):
+        return {"fetch_status": "ok", "final_url": url, "html": "<html/>", "truncated_bytes": False}
+    monkeypatch.delenv("MOCK_FETCH", raising=False)
+    monkeypatch.setattr(T, "_fetch", fake_fetch)
+    monkeypatch.setattr(T.trafilatura, "extract", lambda *a, **k: PAGE)
+    ctx = T.RunContext()
+    impls = T.build_tools(ctx)
+    shown = json.loads(run(impls["fetch_page"]({"url": "https://a.cz"})))
+    assert "ignite" not in shown["text"] and "full_text" not in shown and shown["truncated"] is True
+    found = json.loads(run(impls["find_in_source"]({"url": "https://a.cz", "query": "diesel fuel ignite"})))
+    assert found["passages"] == ["Diesel engines then spray the fuel into the hot compressed air, causing it to ignite."]
+    assert E.verify_quote(ctx.docs["https://a.cz"], found["passages"][0]) == "exact"
+
+
+def test_find_in_source_downloads_a_page_not_fetched_yet(monkeypatch):
+    calls = []
+
+    async def fake_fetch(url):
+        calls.append(url)
+        return {"fetch_status": "http_error", "status": 403}
+    monkeypatch.delenv("MOCK_FETCH", raising=False)
+    monkeypatch.setattr(T, "_fetch", fake_fetch)
+    out = json.loads(run(T.build_tools(T.RunContext())["find_in_source"]({"url": "https://b.cz", "query": "x"})))
+    assert calls == ["https://b.cz"] and out["status"] == 403
+
+
+def test_analyst_evidence_is_kept_only_if_the_quote_is_on_the_page():
+    _, emit = collect()
+    p = Pipeline(MockClient(), emit)
+    p.ctx.docs["https://a.cz"] = {"text": "short", "full_text": PAGE}
+    research = {"findings": [{"id": "f1", "claim": "c", "source_url": "https://a.cz", "quote": "Intro about engines."}]}
+    analysis = {"added_findings": [
+        {"id": "a1", "claim": "ok", "source_url": "https://a.cz", "quote": "Diesel engines then spray the fuel into the hot compressed air"},
+        {"id": "a2", "claim": "invented", "source_url": "https://a.cz", "quote": "This sentence is nowhere on that page."},
+        {"id": "a3", "claim": "other site", "source_url": "https://b.cz", "quote": "Diesel engines then spray the fuel"}]}
+    run(p.add_evidence(research, analysis))
+    assert [f["id"] for f in research["findings"]] == ["f1", "a1"]
+    assert research["findings"][1]["quote_verified"] and "added_findings" not in analysis
+
+
+def test_fact_on_rejected_evidence_goes_back_to_the_analyst():
+    a = {**ANALYSIS, "verified_facts": [*GOOD_FACTS, {"id": "F3", "based_on": ["a2"], "verification_status": "SUPPORTED"}]}
+    assert any("a2" in m for m in C.check_analysis(a, {"f1"}))
+
+
+def test_source_age_counts_by_how_fast_the_claim_ages():
+    url = "https://www.energy.gov/x"
+    assert _score.score(url, "2013")["score"] == 80  # default: time-sensitive
+    assert _score.score(url, "2013", "timeless")["score"] == 90
+    assert _score.score(url, "2013", "slow-changing")["score"] == 80
+    assert _score.score(url, "2020", "slow-changing")["score"] == 90
+    assert _score.score(url, "2026", "timeless")["score"] == 90  # no bonus for being new either
+
+
+def test_research_institute_is_not_an_unknown_site():
+    assert _score.score("https://www.ifpenergiesnouvelles.com/x")["tier"] == "A"
+
+
+def test_simple_questions_get_less_work():
+    from app.agents import AGENTS, MODEL_PLAN
+    assert MODEL_PLAN["simple"]["searches"] == 2 and MODEL_PLAN["simple"]["max_findings"] == 6
+    tools, impls = AGENTS["analyst"].tools(MODEL_PLAN["simple"]["searches"], T.build_tools(T.RunContext()))
+    assert tools[0]["max_uses"] == 1 and "find_in_source" in impls
+    client = Spy(router={"complexity": "simple", "goal": "g", "language": "cs", "subquestions": ["a"]})
+    events, emit = collect()
+    run(Pipeline(client, emit).run("Jak funguje motor?"))
+    assert '"max_findings": 6' in first_user(client.calls, "researcher")
+    assert "<complexity>simple</complexity>" in first_user(client.calls, "analyst")
+    plan = next(e for e in events if e["type"] == "handoff")["payload"]["model_plan"]
+    assert set(plan) == {"researcher", "analyst", "writer"}
 
 
 def test_T05_max_turns_with_pause_turn_fails():

@@ -88,7 +88,35 @@ continue_partial | abort`), v UI v záložce **Validace**.
 | `FAILED` | technická chyba (API, nedokončený tah, refusal); odlišené od nedostatku důkazů |
 
 `max_tokens`, `refusal`, neznámý `stop_reason` ani vyčerpané `max_turns` se nikdy neberou jako hotový
-výstup: agent dostane jeden opravný tah, jinak běh končí `FAILED`.
+výstup. Tah uříznutý na `max_tokens` (`MAX_TOKENS`, do limitu se počítá i thinking) se zahodí a spustí
+znovu s `MAX_TOKENS_RETRY`; neplatný JSON dostane jeden opravný tah. Jinak běh končí `FAILED`, ale
+selhání při **vrácení** už hotovou práci neruší: předchozí výsledek zůstává a běh pokračuje jako `PARTIAL`.
+Vrácený Researcher posílá jen nová a opravená zjištění, kód je sloučí podle `id`.
+
+Agenti s tool smyčkou (Researcher, Analyst) používají prompt caching (`cache_control` na úrovni požadavku,
+5 min). Router a Writer ne: jednorázový zápis do cache by se nikdy nepřečetl. S cache je `input_tokens` jen
+nezacachovaný zbytek, takže UI sčítá všechna pole a cena se počítá z `usage` každé odpovědi zvlášť.
+
+### Doplňující otázky
+
+Po odpovědi se dá ptát dál. `POST /api/jobs` dostane `parent_id` a kontext si server vezme z předchozího
+běhu (patří stejné session, prohlížeč ho nedodává). Otázka projde stejnými agenty: Router ji přepíše na
+`standalone_question`, Researcher dostane `known_findings` a přes `reuse` si převezme zjištění, která už
+existují (citáty se znovu kontrolují proti uloženým stránkám), Writer dostane `earlier_answers`, aby se
+neopakoval. Pamatují se poslední 3 otázky a nejvýše 40 zjištění; při restartu serveru se kontext ztratí.
+Kdo chce začít znovu, klikne na **Nové téma**.
+
+### Kalibrace podle složitosti
+
+Všichni čtyři agenti běží vždy, liší se množství práce (`MODEL_PLAN` v `app/agents.py`): `simple` má 2
+hledání a nejvýše 6 zjištění, `moderate` 5 a 12, `complex` 8 a bez limitu. Analyst u `simple` vrací práci jen
+když na podotázku chybí potvrzený citát a Writer u něj píše krátce s nejvýše 2 body v „Co nevíme“.
+Zdroje se hodnotí podle `temporal_sensitivity` tvrzení: `timeless` (stáří se nepočítá), `slow-changing`
+(staré po 10 letech), `time-sensitive` (staré po 4 letech).
+
+Když citát pokrývá jen část tvrzení, Analyst prohledá plný text zdroje přes `find_in_source` a přidá
+`added_findings`; kód je přijme jen pokud citát na stránce opravdu je. `UNSUPPORTED` a `NOT_CHECKED` smí mít
+prázdné `based_on`, ve finální odpovědi je nelze použít jako ověřený fakt.
 
 ### Evidence ledger (`app/evidence.py`)
 
@@ -173,7 +201,7 @@ Nasazení je v příloze na konci.
 
 ## Co je a není ověřené
 
-- 34 offline testů včetně scénářů z review (stavy, `max_tokens`, paralelní tool_use, citace vs. podpora,
+- 56 offline testů včetně scénářů z review (stavy, `max_tokens`, paralelní tool_use, citace vs. podpora,
   nezávislost, SSRF a rebinding, session a replay, snímky requestů, nevykonaný skill).
 - Mock režim projde UI end-to-end (session → job → SSE → odpověď s důkazy).
 - **Živý běh proti Claude API:** _doplnit po nasazení (datum, dotaz, odkaz na redigovaný trace v `samples/`)._
@@ -197,5 +225,5 @@ a kontrakty, a ověřoval jsem výsledek testy a během v mock režimu. Claude p
 - Docker: `docker build -t research-agents . && docker run -p 8000:8000 --env-file .env research-agents`
 - Server: `deploy/research-agents.service` (systemd) a `deploy/Caddyfile.snippet`
   (`flush_interval -1`, aby SSE události šly hned). Za reverzní proxy nastav `TRUST_PROXY=1`.
-- Proměnné: `ANTHROPIC_API_KEY`, `ACCESS_CODE`, `RUNS_PER_HOUR`, `MAX_CONCURRENT_RUNS`, `MAX_RETURNS`,
-  `MODEL_FAST|BALANCED|STRONG`, `PRICE_FAST|BALANCED|STRONG="in,out"` (USD / 1M tokenů), `PRICE_WEB_SEARCH`.
+- Proměnné: `ANTHROPIC_API_KEY`, `ACCESS_CODE`, `RUNS_PER_HOUR`, `MAX_CONCURRENT_RUNS`, `MAX_RETURNS`, `MAX_TOKENS`, `MAX_TOKENS_RETRY`,
+  `MODEL_FAST|BALANCED|STRONG`, `PRICE_FAST|BALANCED|STRONG="in,out,cache_read"` (USD / 1M tokenů), `PRICE_WEB_SEARCH`.

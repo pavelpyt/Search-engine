@@ -92,7 +92,7 @@ button:disabled { opacity: .45; cursor: default; }
 .ask { display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--border); background: var(--panel); }
 .ask .field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .ask .code-field { grid-column: 1 / -1; }
-.ask .actions { display: flex; align-items: flex-end; }
+.ask .actions { display: flex; align-items: flex-end; gap: 6px; }
 input, textarea { font: 13px/1.45 var(--mono); color: var(--text); background: var(--bg); border: 1px solid var(--border);
   border-radius: 5px; padding: 7px 9px; width: 100%; resize: vertical; }
 input:focus, textarea:focus { outline: none; border-color: var(--text); }
@@ -100,6 +100,7 @@ input:focus, textarea:focus { outline: none; border-color: var(--text); }
 .msg { border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; max-width: 100%; }
 .msg.user { background: var(--panel2); align-self: flex-end; max-width: 80%; }
 .msg.user::before { content: "#OTÁZKA"; display: block; font-size: 10px; font-weight: 700; color: var(--muted); }
+.msg.user.followup::before { content: "#DOPLŇUJÍCÍ OTÁZKA"; }
 .msg.bot.pending { color: var(--muted); }
 .msg.bot.pending::after { content: "▍"; animation: blink 1s steps(1) infinite; }
 .msg.error { color: var(--bad); border-color: var(--bad); }

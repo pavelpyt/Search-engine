@@ -17,6 +17,15 @@ const EXAMPLES = [
 let CONFIG = null;
 let state = null;
 let source = null;
+let parentJob = null;  // the last answered job: the next question follows up on it
+
+function setParent(id) {
+  parentJob = id;
+  $("#qLabel").textContent = id ? "DOPLŇUJÍCÍ OTÁZKA" : "OTÁZKA";
+  $("#send").textContent = id ? "ZEPTAT SE DÁL" : "SPUSTIT VÝZKUM";
+  $("#q").placeholder = id ? "Navaž na odpověď, např. Kolik to bude stát?" : "Např. Jaký je stav zavádění AI ve středních firmách v ČR?";
+  $("#newTopic").classList.toggle("hidden", !id);
+}
 
 function freshState() {
   const agents = {};
@@ -54,6 +63,8 @@ function renderPipeline() {
   });
 }
 
+const allTokens = (u) => (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.output_tokens || 0);
+
 function updateCard(key) {
   const a = state.agents[key];
   const card = $(`.card[data-agent="${key}"]`);
@@ -64,7 +75,7 @@ function updateCard(key) {
   $(".step", card).textContent = a.step || "";
   const m = $(".tag.model", card), t = $(".tag.tokens", card);
   if (a.model) { m.textContent = a.model.replace("claude-", ""); m.classList.remove("hidden"); }
-  if (a.usage) { t.textContent = `${(a.usage.input_tokens + a.usage.output_tokens).toLocaleString("cs-CZ")} TOK · ${usd(a.usage.cost_usd)}`; t.classList.remove("hidden"); }
+  if (a.usage) { t.textContent = `${allTokens(a.usage).toLocaleString("cs-CZ")} TOK · ${usd(a.usage.cost_usd)}`; t.classList.remove("hidden"); }
 }
 
 function setEdge(from, to, cls, label) {
@@ -175,6 +186,7 @@ function onEvent(e) {
       break;
     case "final":
       renderAnswer(e);
+      if ((e.answer_markdown || "").trim()) setParent(state.runId);
       log("FIN", `${esc(STATUS_LABEL[e.status] || e.status)} za ${String(e.duration_s).replace(".", ",")} s · odhad ceny API ${usd(e.cost_usd)}`,
         e.status === "COMPLETED" ? "good" : e.status === "FAILED" ? "err" : "warn");
       $("#runTag").textContent = STATUS_LABEL[e.status] || e.status;
@@ -183,7 +195,7 @@ function onEvent(e) {
     case "error":
       log("ERR", esc(e.msg), "err");
       for (const k in state.agents) if (state.agents[k].status === "working") { state.agents[k].status = "error"; updateCard(k); }
-      if (!state.runId && pending()) { pending().classList.add("error"); pending().textContent = "CHYBA · " + e.msg; }
+      if (!state.runId && pending()) { const p = pending(); p.className = "msg bot error"; p.textContent = "CHYBA · " + e.msg; }
       break;
     case "run_finished":
       state.finished = true;
@@ -195,6 +207,7 @@ function onEvent(e) {
 
 // ---------- answer ----------
 const pending = () => $(".msg.bot.pending");
+const srcId = (n) => `src-${state.runId}-${n}`;  // one page holds several answers, each with its own [n]
 
 const okTag = (ok) => `<span class="tag ${ok ? "good" : "bad"}">${ok ? "OK" : "CHYBA"}</span>`;
 const num = (n) => (n == null ? "–" : String(n).replace(".", ","));
@@ -204,7 +217,7 @@ function evidenceHtml(e) {
   const facts = e.ledger.map((f) => `<li class="rule"><div class="line"><span class="tag ${VSTATUS_TAG[f.verification_status] || ""}">${esc(VSTATUS_CZ[f.verification_status] || f.verification_status)}</span>
       <b>${esc(f.fact_id)}</b> ${esc(f.statement)}</div>
       <div class="why">JISTOTA ${esc(String(f.confidence).toUpperCase())}${f.independent_corroboration ? " · nezávisle potvrzeno" : ""}${f.limitations.length ? " · " + esc(f.limitations.join(", ")) : ""}</div>
-      <ul>${f.evidence.map((x) => `<li><span class="tag ${x.quote_verified ? "good" : "warn"}">${x.quote_verified ? "CITÁT OK" : "CITÁT ?"}</span> <span class="note">${esc(x.quote_check)}</span> „${esc(short(x.quote, 220))}“ ${x.source_n ? `<a href="#src-${x.source_n}" class="cite">[${x.source_n}]</a>` : ""}</li>`).join("")}</ul></li>`).join("");
+      <ul>${f.evidence.map((x) => `<li><span class="tag ${x.quote_verified ? "good" : "warn"}">${x.quote_verified ? "CITÁT OK" : "CITÁT ?"}</span> <span class="note">${esc(x.quote_check)}</span> „${esc(short(x.quote, 220))}“ ${x.source_n ? `<a href="#${srcId(x.source_n)}" class="cite">[${x.source_n}]</a>` : ""}</li>`).join("")}</ul></li>`).join("");
   return `<details class="evidence"><summary>#DŮKAZY · ${e.ledger.length} FAKTŮ</summary>
     <p class="note">CITÁT OK = citát nalezen v textu stažené stránky (neznamená, že je pravdivý). Tier zdroje je jen apriorní odhad podle URL.</p><ul class="checks">${facts}</ul></details>`;
 }
@@ -227,14 +240,14 @@ function statsHtml(e) {
 function renderAnswer(e) {
   const el = pending() || document.createElement("div");
   el.className = "msg bot";
-  const md = (e.answer_markdown || "").replace(/\[(\d+)\]/g, (m, n) => `<a class="cite" href="#src-${n}">[${n}]</a>`);
+  const md = (e.answer_markdown || "").replace(/\[(\d+)\]/g, (m, n) => `<a class="cite" href="#${srcId(n)}">[${n}]</a>`);
   const html = DOMPurify.sanitize(marked.parse(md), { ADD_ATTR: ["target"] });
   const tierTag = { A: "good", B: "strong", C: "warn", D: "bad" };
-  const sources = (e.sources || []).map((s) => `<li id="src-${s.n}"><span class="n">[${s.n}]</span>${s.tier ? `<span class="tag ${tierTag[s.tier] || ""}" title="apriorní skóre ${s.score ?? "?"}">TIER ${s.tier}</span>` : ""}
+  const sources = (e.sources || []).map((s) => `<li id="${srcId(s.n)}"><span class="n">[${s.n}]</span>${s.tier ? `<span class="tag ${tierTag[s.tier] || ""}" title="apriorní skóre ${s.score ?? "?"}">TIER ${s.tier}</span>` : ""}
       <a href="${esc(safeUrl(s.url))}" target="_blank" rel="noopener noreferrer">${esc(s.title)}</a></li>`).join("");
   const q = e.quality;
   const checks = q ? q.checks.map((c) => `<li class="rule"><div class="line">${okTag(c.ok)} ${esc(c.name)}</div>${c.detail ? `<div class="${c.ok ? "why" : "fix"}">${esc(c.detail)}</div>` : ""}</li>`).join("") : "";
-  const usage = Object.entries(e.usage || {}).map(([k, u]) => `${label(k).toUpperCase()} ${u.model.replace("claude-", "")} · ${(u.input_tokens + u.output_tokens).toLocaleString("cs-CZ")} tok · ${u.web_searches || 0} hledání · ${usd(u.cost_usd)}`).join("<br>");
+  const usage = Object.entries(e.usage || {}).map(([k, u]) => `${label(k).toUpperCase()} ${u.model.replace("claude-", "")} · ${allTokens(u).toLocaleString("cs-CZ")} tok (${(u.cache_read_input_tokens || 0).toLocaleString("cs-CZ")} z cache) · ${u.web_searches || 0} hledání · ${usd(u.cost_usd)}`).join("<br>");
   const reasons = (e.status_reasons || []).length ? `<ul class="reasons">${e.status_reasons.map((r) => `<li>${esc(r)}</li>`).join("")}</ul>` : "";
   el.innerHTML = `<div class="runhead"><span class="tag ${STATUS_TAG[e.status] || ""}">${esc(STATUS_LABEL[e.status] || e.status)}</span>
       <span class="note">SLOŽITOST ${esc(String(e.complexity || "–").toUpperCase())} · ${num(e.duration_s)} s</span></div>${reasons}
@@ -304,7 +317,7 @@ async function showTab(tab) {
   if (tab === "system") body.innerHTML = inv.map((x, i) => head(i, x) + `<pre>${esc(x.system)}</pre>`).join("");
   if (tab === "calls") body.innerHTML = `<p class="note">Každý POST na <code>/v1/messages</code> zvlášť: přesný (redigovaný) snímek pole <code>messages</code> v okamžiku odeslání a odpověď. Šifrovaný obsah vyhledávání zůstává jen v požadavku na API.</p>` +
     a.calls.map((c, i) => `<details ${i === a.calls.length - 1 ? "open" : ""}><summary><b>Request ${i + 1}</b> · ${esc(c.request.model)} · ${c.request.messages.length} zpráv · tools: ${esc(c.request.tools.join(", ") || "–")}
-      ${c.response ? ` → <b>Response ${i + 1}</b>: stop_reason <code>${esc(c.response.stop_reason)}</code>, ${c.response.duration_ms} ms, ${(c.response.usage.input_tokens || 0) + (c.response.usage.output_tokens || 0)} tok` : " → čeká"}</summary>
+      ${c.response ? ` → <b>Response ${i + 1}</b>: stop_reason <code>${esc(c.response.stop_reason)}</code>, ${c.response.duration_ms} ms, ${allTokens(c.response.usage)} tok` : " → čeká"}</summary>
       ${msgsHtml(c.request.messages)}</details>`).join("");
   if (tab === "messages") body.innerHTML = `<p class="note">Konverzace po doběhnutí agenta (včetně jeho odpovědí a tool_result).</p>` +
     inv.map((x, i) => head(i, x) + msgsHtml(x.final || x.messages) + `<details><summary class="note">Raw JSON</summary><pre>${esc(json(x.final || x.messages))}</pre></details>`).join("<hr>");
@@ -350,14 +363,17 @@ async function start(question) {
   $("#runTag").textContent = "BĚŽÍ"; $("#runTag").className = "tag hl";
   $("#empty")?.remove();
   $("#send").disabled = true;
+  const parent_id = parentJob;
+  const body = JSON.stringify({ question, parent_id });
   const thread = $("#thread");
-  thread.insertAdjacentHTML("beforeend", `<div class="msg user">${esc(question)}</div><div class="msg bot pending">BĚŽÍ · agenti pracují, sleduj karty nahoře a #PRŮBĚH.</div>`);
+  thread.insertAdjacentHTML("beforeend", `<div class="msg user${parent_id ? " followup" : ""}">${esc(question)}</div><div class="msg bot pending">BĚŽÍ · agenti pracují, sleduj karty nahoře a #PRŮBĚH.</div>`);
   thread.scrollTop = thread.scrollHeight;
   const fail = (msg) => { onEvent({ type: "error", msg }); $("#send").disabled = false; };
   if (!(await ensureSession())) return fail("Špatný přístupový kód.");
   let r = await fetch("/api/jobs", { method: "POST", headers: { "content-type": "application/json" },
-    credentials: "same-origin", body: JSON.stringify({ question }) });
-  if (r.status === 401) { hasSession = false; if (await ensureSession()) r = await fetch("/api/jobs", { method: "POST", headers: { "content-type": "application/json" }, credentials: "same-origin", body: JSON.stringify({ question }) }); }
+    credentials: "same-origin", body });
+  if (r.status === 401) { hasSession = false; if (await ensureSession()) r = await fetch("/api/jobs", { method: "POST", headers: { "content-type": "application/json" }, credentials: "same-origin", body }); }
+  if (r.status === 404 && parent_id) { setParent(null); $("#q").value = question; return fail("Předchozí běh už na serveru není. Pošli otázku znovu jako nové téma."); }
   if (!r.ok) { const d = await r.json().catch(() => ({})); return fail(d.detail || `Chyba ${r.status}`); }
   const { job_id } = await r.json();
   source = new EventSource(`/api/jobs/${job_id}/events`);
@@ -372,17 +388,18 @@ async function start(question) {
 
 function renderHow() {
   const plan = CONFIG.model_plan;
-  const rows = Object.entries(plan).map(([k, v]) => `<tr><td>${k}</td><td>${CONFIG.models[v.researcher]}</td><td>${CONFIG.models[v.analyst]}</td><td>${CONFIG.models[v.writer]}</td><td>${v.searches}</td></tr>`).join("");
+  const rows = Object.entries(plan).map(([k, v]) => `<tr><td>${k}</td><td>${CONFIG.models[v.researcher]}</td><td>${CONFIG.models[v.analyst]}</td><td>${CONFIG.models[v.writer]}</td><td>${v.searches}</td><td>${v.max_findings || "dle potřeby"}</td></tr>`).join("");
   $("#howBody").innerHTML = `
     <p><b>Sekvenční pipeline v kódu</b> (<code>app/orchestrator.py</code>): Router → Researcher → Analyst → Writer → kontrola výstupu.
     Agenti spolu nemluví napřímo; data mezi nimi předává jen orchestrátor.</p>
     <p><b>Handoff:</b> každý agent vrací JSON. Orchestrátor ho zkontroluje proti kontraktu (<code>app/contracts.py</code>) a přijímající agent
     navíc dělá vlastní <code>handoff_check</code>. Když něco chybí, práce se jednou vrátí zpět (RET v #PRŮBĚH).</p>
     <p><b>Router</b> (vždy ${esc(CONFIG.models.fast)}) určí složitost; kód podle ní vybere modely a počet vyhledávání:</p>
-    <table><tr><th>složitost</th><th>Researcher</th><th>Analyst</th><th>Writer</th><th>hledání</th></tr>${rows}</table>
+    <table><tr><th>složitost</th><th>Researcher</th><th>Analyst</th><th>Writer</th><th>hledání</th><th>zjištění</th></tr>${rows}</table>
     <p><b>Nástroje:</b> Researcher – <code>web_search</code> (server tool Anthropic) a <code>fetch_page</code> (náš klient, trafilatura).
-    Analyst – <code>evaluate_source</code> (skript skillu) a omezený <code>web_search</code> na ověření. Writer – bez nástrojů.</p>
+    Analyst – <code>evaluate_source</code> (skript skillu), <code>find_in_source</code> (hledá důkaz v plném textu zdroje) a omezený <code>web_search</code> na ověření. Writer – bez nástrojů.</p>
     <p><b>Skills:</b></p><ul>${CONFIG.skills.map((s) => `<li><code>${esc(s.name)}</code> – ${esc(s.description)}</li>`).join("")}</ul>
+    <p><b>Doplňující otázka:</b> projde stejnými agenty. Router z ní s pomocí předchozí konverzace udělá samostatnou otázku, Researcher může převzít už nalezená zjištění a dohledá jen to nové, Writer neopakuje předchozí odpovědi. Kontext drží server, poslední 3 otázky a nejvýše 40 zjištění.</p>
     <p><b>Výsledek</b> má stav: <span class="tag good">HOTOVO</span>, <span class="tag warn">ČÁSTEČNĚ</span>, <span class="tag warn">MÁLO DŮKAZŮ</span> nebo <span class="tag bad">CHYBA</span>. Po vyčerpání vrácení se nikdy netváří jako hotový.</p>
     <p><b>Důkazy:</b> každé zjištění má doslovný citát; kód ho hledá v textu stažené stránky (CITÁT OK / CITÁT ?). Writer smí citovat jen fakta z ledgeru a kód kontroluje, že každé [n] patří k použitému faktu.</p>
     <p>Klikni na kartu agenta: system prompt, každé API volání zvlášť (request/response), finální konverzace, tools, výstup, validace předání a skill.</p>
@@ -400,7 +417,8 @@ async function init() {
   renderHow();
   $("#examples").innerHTML = EXAMPLES.map((q) => `<button type="button">${esc(q)}</button>`).join("");
   $("#examples").querySelectorAll("button").forEach((b) => b.addEventListener("click", () => { $("#q").value = b.textContent; }));
-  $("#ask").addEventListener("submit", (ev) => { ev.preventDefault(); const q = $("#q").value.trim(); if (q.length >= 3) { start(q); $("#q").value = ""; } });
+  $("#ask").addEventListener("submit", (ev) => { ev.preventDefault(); const q = $("#q").value.trim(); if (q.length >= 3 && !$("#send").disabled) { start(q); $("#q").value = ""; } });
+  $("#newTopic").addEventListener("click", () => { setParent(null); $("#q").focus(); });
   $("#q").addEventListener("keydown", (ev) => { if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); $("#ask").requestSubmit(); } });
   $("#drawerClose").addEventListener("click", () => $("#drawer").classList.add("hidden"));
   $("#howBtn").addEventListener("click", () => $("#how").classList.remove("hidden"));

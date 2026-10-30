@@ -10,36 +10,83 @@ Every handoff is a gate: JSON → contract check in code → the receiving agent
 own `handoff_check`. A failed gate is returned once; when the returns are used
 up the run never pretends it is complete: it continues as PARTIAL (a supported
 subset exists) or stops as INSUFFICIENT_EVIDENCE. Technical failures end as
-FAILED. Agents never talk to each other; only this module moves data.
+FAILED, except on a return: that work only improves a result we already hold,
+so losing it means PARTIAL. Agents never talk to each other; only this module
+moves data.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Awaitable, Callable
 
 from . import contracts as C
 from . import evidence as E
-from .agents import AGENTS, MODEL_PLAN, MODELS, estimate_cost
-from .llm import COMPLETE_STOPS, AgentIncompleteError, extract_json, run_agent
+from .agents import AGENTS, MODEL_PLAN, MODELS
+from .llm import COMPLETE_STOPS, USAGE_FIELDS, AgentIncompleteError, extract_json, run_agent
 from .tools import RunContext, build_tools
 
 MAX_RETURNS = int(os.getenv("MAX_RETURNS", "1"))
 Emit = Callable[[dict], Awaitable[None]]
 
+# What a follow-up question inherits from the runs before it.
+MEMORY_TURNS, MEMORY_FINDINGS, MEMORY_ANSWER_CHARS, MAX_QUESTION = 3, 40, 1500, 500
+
 COMPLETED, PARTIAL, INSUFFICIENT, FAILED = "COMPLETED", "PARTIAL", "INSUFFICIENT_EVIDENCE", "FAILED"
 
 
+def known_list(findings: list[dict]) -> list[dict]:
+    """The short form of findings shown back to the Researcher: enough to judge them, no quotes."""
+    return [{k: f.get(k) for k in ("id", "claim", "source_url", "quote_check")} for f in findings]
+
+
 class Pipeline:
-    def __init__(self, client, emit: Emit):
+    def __init__(self, client, emit: Emit, memory: dict | None = None):
         self.client = client
         self.emit = emit
+        self.memory = memory or {}
+        self.question = ""
+        self.findings: list[dict] = []
         self.usage: dict[str, dict] = {}
         self.ctx = RunContext()
+        self.ctx.docs.update(self.memory.get("docs", {}))  # reused quotes are checked against these
         self.impls = build_tools(self.ctx)
         self.partial_reasons: list[str] = []
         self.t0 = time.monotonic()
+
+    # ---- follow-up questions -------------------------------------------
+    def conversation(self) -> list[dict]:
+        """Earlier turns for the prompts. [n] numbers belong to their own run, so they are removed."""
+        return [{"question": t["question"], "answer": re.sub(r"\s*\[\d+\]", "", t["answer"])[:MEMORY_ANSWER_CHARS]}
+                for t in self.memory.get("turns", [])]
+
+    def next_memory(self, result: dict) -> dict:
+        """What a follow-up to this run inherits. Ids are renumbered so they never clash with new `f` ids."""
+        turns = self.memory.get("turns", [])
+        if result["answer_markdown"].strip():
+            turns = [*turns, {"question": self.question, "answer": result["answer_markdown"]}]
+        pool = {(f["source_url"], f.get("quote")): f
+                for f in [*self.memory.get("findings", []), *self.findings] if f.get("source_url")}
+        findings = [{**f, "id": f"k{i}"} for i, f in enumerate(list(pool.values())[-MEMORY_FINDINGS:], 1)]
+        urls = {f["source_url"] for f in findings}
+        return {"turns": turns[-MEMORY_TURNS:], "findings": findings,
+                "docs": {u: d for u, d in self.ctx.docs.items() if u in urls}}
+
+    # ---- evidence found by the Analyst ---------------------------------
+    async def add_evidence(self, research: dict, analysis: dict):
+        """Findings dug out with find_in_source join the research, but only if code finds the quote."""
+        added = analysis.pop("added_findings", None) or []
+        kept = [f for f in added if f.get("id") and E.verify_quote(self.ctx.docs.get(f.get("source_url", "")),
+                                                                   f.get("quote", "")) in {"exact", "normalized"}]
+        if len(kept) < len(added):
+            rejected = [f.get("id") for f in added if f not in kept]
+            await self.emit({"type": "log", "level": "warn", "msg": f"Analyst evidence rejected, quote not in the page: {rejected}"})
+        if kept:
+            research["findings"] = E.merge_research(research, {"findings": kept})["findings"]
+            self.findings = E.annotate_findings(research, self.ctx.docs)
+            await self.emit({"type": "log", "level": "info", "msg": f"Analyst added evidence from fetched pages: {[f['id'] for f in kept]}"})
 
     # ---- helpers -------------------------------------------------------
     async def status(self, agent: str, status: str, step: str = ""):
@@ -59,6 +106,8 @@ class Pipeline:
         await self.add_usage(key, model, result.usage)
         if result.stop_reason in {"refusal"}:
             raise AgentIncompleteError(key, result.stop_reason, "The model refused.")
+        if result.stop_reason == "max_tokens":  # run_agent already re-ran the turn with more room
+            raise AgentIncompleteError(key, result.stop_reason, "Cut off even at the raised limit.")
         data, problem = None, None
         if result.stop_reason in COMPLETE_STOPS:
             try:
@@ -70,9 +119,8 @@ class Pipeline:
         if data is None:
             # One bounded repair turn in the same conversation.
             await self.emit({"type": "log", "level": "warn", "msg": f"{key}: {problem}; one repair turn"})
-            hint = " Your reply was cut off: be much more concise." if result.stop_reason == "max_tokens" else ""
             repair = result.messages + [{"role": "user", "content":
-                     f"Your last reply was incomplete or invalid: {problem}.{hint} "
+                     f"Your last reply was incomplete or invalid: {problem}. "
                      "Reply again with ONLY the complete JSON object described in your instructions."}]
             result = await run_agent(client=self.client, agent=key, model=model, system=system, messages=repair,
                                      tools=tool_defs, client_tools=impls, emit=self.emit, max_turns=2)
@@ -87,13 +135,23 @@ class Pipeline:
         return data
 
     async def add_usage(self, key: str, model: str, usage: dict):
-        u = self.usage.setdefault(key, {"model": model, "input_tokens": 0, "output_tokens": 0,
+        u = self.usage.setdefault(key, {"model": model, **dict.fromkeys(USAGE_FIELDS, 0),
                                         "web_searches": 0, "cost_usd": 0.0})
         u["model"] = model
-        for k in ("input_tokens", "output_tokens", "web_searches"):
+        for k in (*USAGE_FIELDS, "web_searches"):
             u[k] += usage.get(k, 0)
-        u["cost_usd"] = estimate_cost(model, u["input_tokens"], u["output_tokens"], u["web_searches"])
+        u["cost_usd"] = round(u["cost_usd"] + usage.get("cost_usd", 0), 4)
         await self.emit({"type": "usage", "agent": key, **u})
+
+    async def try_return(self, agent: str, work) -> dict | None:
+        """Await returned work; on a technical failure report it and return None (keep the earlier result)."""
+        try:
+            return await work
+        except RuntimeError as exc:
+            await self.emit({"type": "log", "level": "warn", "msg": f"{agent}: return failed, keeping earlier result: {exc}"})
+            await self.status(agent, "done", "Návrat selhal, ponechávám předchozí výsledek")
+            self.partial_reasons.append(f"Return to {agent} failed, earlier result kept: {exc}")
+            return None
 
     async def handoff(self, src: str, dst: str, payload: dict, code_missing: list[str]):
         await self.emit({"type": "handoff", "from": src, "to": dst, "payload": payload,
@@ -109,15 +167,24 @@ class Pipeline:
     # ---- steps ---------------------------------------------------------
     async def route(self, question: str) -> dict:
         await self.status("router", "working", "Hodnotím náročnost a dělím otázku")
-        r = await self.call("router", "fast", f"<question>{question}</question>")
+        turns = self.conversation()
+        content = f"<question>{question}</question>"
+        if turns:
+            content = f"<conversation>\n{json.dumps(turns, ensure_ascii=False, indent=2)}\n</conversation>\n{content}"
+        r = await self.call("router", "fast", content)
         missing = C.check_router(r)
         if missing:  # router is cheap: fall back to safe defaults instead of failing
             r.setdefault("subquestions", [question])
             if r.get("complexity") not in C.COMPLEXITY:
                 r["complexity"] = "moderate"
             await self.emit({"type": "log", "level": "warn", "msg": f"Router output fixed: {missing}"})
+        r["question"] = question
+        standalone = r.get("standalone_question")
+        if turns and isinstance(standalone, str) and standalone.strip():
+            r["question"] = standalone.strip()[:MAX_QUESTION]
+            await self.emit({"type": "log", "level": "info", "msg": f"Doplňující otázka: {r['question']}"})
         plan = MODEL_PLAN[r["complexity"]]
-        r["model_plan"] = {k: MODELS[v] for k, v in plan.items() if k != "searches"}
+        r["model_plan"] = {k: MODELS[plan[k]] for k in ("researcher", "analyst", "writer")}
         r["search_budget"] = plan["searches"]
         await self.status("router", "done", f"Náročnost: {r['complexity']}")
         return r
@@ -127,17 +194,27 @@ class Pipeline:
         plan = MODEL_PLAN[route["complexity"]]
         await self.status("researcher", "working", "Dohledávám, co chybělo" if feedback else "Hledám na webu a čtu zdroje")
         payload = {"question": question, "goal": route.get("goal"), "subquestions": route["subquestions"],
-                   "language": route.get("language", "same as question")}
+                   "language": route.get("language", "same as question"), "complexity": route["complexity"]}
+        if plan["max_findings"]:
+            payload["max_findings"] = plan["max_findings"]
         content = f"<handoff from=\"router\">\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n</handoff>"
+        known = self.memory.get("findings", [])
+        if known:
+            content += ("\n\n<known_findings>\n" + json.dumps(known_list(known), ensure_ascii=False, indent=2)
+                        + "\n</known_findings>")
         if feedback:
             content += ("\n\n<feedback from=\"orchestrator/analyst\">Your work was returned. Missing:\n- "
-                        + "\n- ".join(feedback) + "\nKeep your previous findings (below) and add what is missing. "
-                        "Return the complete merged JSON.</feedback>")
+                        + "\n- ".join(feedback) + "\nYour earlier findings (listed below) are kept in code: do NOT "
+                        "repeat them. Return only new findings and corrections, with `gaps` as they stand now.</feedback>")
             if previous:
-                content += ("\n\n<previous_research>\n" + json.dumps(previous, ensure_ascii=False, indent=2)
+                earlier = {"findings": known_list(previous.get("findings", [])), "gaps": previous.get("gaps")}
+                content += ("\n\n<previous_research>\n" + json.dumps(earlier, ensure_ascii=False, indent=2)
                             + "\n</previous_research>")
         r = await self.call("researcher", plan["researcher"], content, searches=plan["searches"])
-        findings = E.annotate_findings(r, self.ctx.docs)
+        E.reuse_findings(r, known)
+        if previous:
+            r = E.merge_research(previous, r)
+        findings = self.findings = E.annotate_findings(r, self.ctx.docs)
         verified = sum(1 for f in findings if f["quote_verified"])
         await self.status("researcher", "done", f"{len(findings)} zjištění, {verified} citátů ověřeno v textu")
         return r
@@ -147,6 +224,7 @@ class Pipeline:
         plan = MODEL_PLAN[route["complexity"]]
         await self.status("analyst", "working", "Doplňuji, co chtěl writer" if feedback else "Hodnotím zdroje a ověřuji tvrzení")
         content = (f"<question>{question}</question>\n<goal>{route.get('goal', '')}</goal>\n"
+                   f"<complexity>{route['complexity']}</complexity>\n"
                    f"<handoff from=\"researcher\">\n{json.dumps(research, ensure_ascii=False, indent=2)}\n</handoff>")
         if feedback:
             content += ("\n\n<feedback from=\"orchestrator/writer\">Your work was returned. Missing:\n- "
@@ -155,6 +233,7 @@ class Pipeline:
                 content += ("\n\n<previous_analysis>\n" + json.dumps(previous, ensure_ascii=False, indent=2)
                             + "\n</previous_analysis>")
         a = await self.call("analyst", plan["analyst"], content, searches=plan["searches"])
+        await self.add_evidence(research, a)
         urls = sorted({f.get("source_url") for f in research.get("findings", []) if f.get("source_url")})
         not_scored = [u for u in urls if u not in self.ctx.scored]
         await self.emit({"type": "skill_result", "agent": "analyst", "skill": "source-evaluation",
@@ -176,6 +255,8 @@ class Pipeline:
                                      if f["verification_status"] not in E.SUPPORTING],
                    "open_questions": open_questions,
                    "sources": [{"n": s["n"], "title": s["title"], "url": s["url"], "tier": s["tier"]} for s in sources]}
+        if self.conversation():
+            payload["earlier_answers"] = self.conversation()
         content = f"<handoff from=\"analyst\">\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n</handoff>"
         w = await self.call("writer", plan["writer"], content)
         await self.status("writer", "done", "Odpověď hotová")
@@ -183,6 +264,7 @@ class Pipeline:
 
     # ---- the pipeline --------------------------------------------------
     async def run(self, question: str) -> dict:
+        self.question = question
         try:
             return await self._run(question)
         except Exception as exc:  # technical failure ≠ lack of evidence
@@ -191,12 +273,14 @@ class Pipeline:
 
     async def _run(self, question: str) -> dict:
         route = await self.route(question)
-        await self.handoff("router", "researcher", {"goal": route.get("goal"), "subquestions": route["subquestions"],
+        question = self.question = route["question"]
+        await self.handoff("router", "researcher", {"question": question, "goal": route.get("goal"), "subquestions": route["subquestions"],
                                                     "complexity": route["complexity"],
                                                     "model_plan": route["model_plan"]}, [])
 
         # --- gate 1: Researcher -> Analyst
         research = await self.research(question, route)
+        analysis = None
         returns, attempt = 0, 1
         while True:
             missing = C.check_research(research)
@@ -207,16 +291,22 @@ class Pipeline:
                     await self.validation("researcher_to_analyst", "researcher", "analyst", attempt, missing, None,
                                           "rejected", "retry")
                     await self.status("researcher", "returned", "Kontrakt nesplněn: " + "; ".join(missing))
-                    research = await self.research(question, route, feedback=missing, previous=research)
-                    attempt += 1
-                    continue
+                    update = await self.try_return("researcher", self.research(question, route, feedback=missing,
+                                                                               previous=research))
+                    if update:
+                        research = update
+                        attempt += 1
+                        continue
                 usable = [f for f in research.get("findings", []) if f.get("source_url")]
                 if not usable:
                     await self.validation("researcher_to_analyst", "researcher", "analyst", attempt, missing, None,
                                           "rejected", "abort")
                     return await self.insufficient(route, research, ["Researcher found no sourced findings."])
                 self.partial_reasons.append("Research contract not met after returns: " + "; ".join(missing))
-            analysis = await self.analyse(question, route, research)
+            if analysis is None:
+                analysis = await self.analyse(question, route, research)
+            else:  # second pass over the extended research: the first analysis is still valid
+                analysis = await self.try_return("analyst", self.analyse(question, route, research)) or analysis
             check = analysis.get("handoff_check") or {"ok": True, "missing": []}
             if not check.get("ok", True) and returns < MAX_RETURNS:
                 returns += 1
@@ -225,9 +315,12 @@ class Pipeline:
                 await self.emit({"type": "handoff_return", "from": "analyst", "to": "researcher",
                                  "missing": check.get("missing", [])})
                 await self.status("researcher", "returned", "Analytik chce doplnit")
-                research = await self.research(question, route, feedback=check.get("missing", []), previous=research)
-                attempt += 1
-                continue
+                update = await self.try_return("researcher", self.research(question, route, feedback=check.get("missing", []),
+                                                                           previous=research))
+                if update:
+                    research = update
+                    attempt += 1
+                    continue
             if not check.get("ok", True):
                 self.partial_reasons.append("Analyst still missing: " + "; ".join(check.get("missing", [])))
             accepted = "accepted" if not missing and check.get("ok", True) else "partial"
@@ -252,9 +345,12 @@ class Pipeline:
                 w_returns += 1
                 await self.validation("analyst_to_writer", "analyst", "writer", attempt, missing, None, "rejected", "retry")
                 await self.status("analyst", "returned", "Kontrakt nesplněn: " + "; ".join(missing))
-                analysis = await self.analyse(question, route, research, feedback=missing, previous=analysis)
-                attempt += 1
-                continue
+                update = await self.try_return("analyst", self.analyse(question, route, research, feedback=missing,
+                                                                       previous=analysis))
+                if update:
+                    analysis = update
+                    attempt += 1
+                    continue
             if missing:
                 if not supported:
                     await self.validation("analyst_to_writer", "analyst", "writer", attempt, missing, None,
@@ -271,10 +367,12 @@ class Pipeline:
                 await self.emit({"type": "handoff_return", "from": "writer", "to": "analyst",
                                  "missing": check.get("missing", [])})
                 await self.status("analyst", "returned", "Writer chce doplnit")
-                analysis = await self.analyse(question, route, research, feedback=check.get("missing", []),
-                                              previous=analysis)
-                attempt += 1
-                continue
+                update = await self.try_return("analyst", self.analyse(question, route, research,
+                                                                       feedback=check.get("missing", []), previous=analysis))
+                if update:
+                    analysis = update
+                    attempt += 1
+                    continue
             if not check.get("ok", True):
                 self.partial_reasons.append("Writer still missing: " + "; ".join(check.get("missing", [])))
             accepted = "accepted" if not missing and check.get("ok", True) else "partial"

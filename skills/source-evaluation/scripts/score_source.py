@@ -5,7 +5,7 @@ Part of the `source-evaluation` skill. The analysis agent calls it through the
 SKILL.md rubric describes. Keeping the base score in code makes it repeatable:
 the same URL always starts from the same number.
 
-Usage: python score_source.py <url> [page_age]
+Usage: python score_source.py <url> [page_age] [timeless|slow-changing|time-sensitive]
 """
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ def _domains(*names: str) -> re.Pattern:
 RULES: list[tuple[str, int, re.Pattern]] = [
     ("official", 90, re.compile(r"(^|\.)(gov|gov\.[a-z]{2}|europa\.eu|who\.int|un\.org|oecd\.org|czso\.cz|cnb\.cz|mfcr\.cz|justice\.cz)$")),
     ("research", 85, re.compile(r"(^|\.)(edu|ac\.[a-z]{2}|arxiv\.org|doi\.org|nature\.com|sciencedirect\.com|ncbi\.nlm\.nih\.gov|pubmed\.ncbi\.nlm\.nih\.gov|springer\.com|acm\.org|ieee\.org)$")),
+    ("research", 85, _domains("ifpenergiesnouvelles.com", "ifpenergiesnouvelles.fr")),
     ("reputable_media", 75, _domains("reuters.com", "apnews.com", "bbc.co.uk", "bbc.com", "ft.com", "economist.com",
                                      "nytimes.com", "wsj.com", "bloomberg.com", "theguardian.com",
                                      "ct24.ceskatelevize.cz", "irozhlas.cz", "seznamzpravy.cz", "hn.cz", "e15.cz",
@@ -39,6 +40,8 @@ RULES: list[tuple[str, int, re.Pattern]] = [
 ]
 
 TIERS = [(80, "A"), (65, "B"), (45, "C"), (0, "D")]
+# Years after which a source counts as old, by how fast its claims go out of date.
+OLD_AFTER = {"timeless": None, "slow-changing": 10, "time-sensitive": 4}
 
 
 def _year(page_age: str | None) -> int | None:
@@ -48,7 +51,7 @@ def _year(page_age: str | None) -> int | None:
     return int(m.group(0)) if m else None
 
 
-def score(url: str, page_age: str | None = None) -> dict:
+def score(url: str, page_age: str | None = None, temporal_sensitivity: str = "time-sensitive") -> dict:
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower().removeprefix("www.")
     signals: list[str] = []
@@ -65,13 +68,16 @@ def score(url: str, page_age: str | None = None) -> dict:
         s -= 10
         signals.append("no https (-10)")
 
+    old_after = OLD_AFTER.get(temporal_sensitivity, OLD_AFTER["time-sensitive"])
     year = _year(page_age)
-    if year:
+    if old_after is None:
+        signals.append("timeless claim: age ignored")
+    elif year:
         age = date.today().year - year
         if age <= 1:
             s += 5
             signals.append(f"recent ({year}, +5)")
-        elif age >= 4:
+        elif age >= old_after:
             s -= 10
             signals.append(f"old ({year}, -10)")
     else:
@@ -80,11 +86,11 @@ def score(url: str, page_age: str | None = None) -> dict:
     s = max(0, min(100, s))
     tier = next(t for limit, t in TIERS if s >= limit)
     return {"url": url, "host": host, "source_type": source_type,
-            "score": s, "tier": tier, "signals": signals}
+            "score": s, "tier": tier, "signals": signals, "temporal_sensitivity": temporal_sensitivity}
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(1)
-    print(json.dumps(score(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None), indent=2))
+    print(json.dumps(score(*sys.argv[1:4]), indent=2))

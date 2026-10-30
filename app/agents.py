@@ -16,32 +16,45 @@ MODELS = {
     "strong": os.getenv("MODEL_STRONG", "claude-opus-5-5"),
 }
 
-# USD per million tokens (input, output). Estimates for the cost shown in the UI;
-# override with PRICE_<TIER>="in,out" if your contract differs.
-def _price(tier: str, default: tuple[float, float]) -> tuple[float, float]:
+# USD per million tokens (input, output, cache read). Estimates for the cost shown in
+# the UI; override with PRICE_<TIER>="in,out,read" if your contract differs.
+def _price(tier: str, default: tuple[float, float, float]) -> tuple[float, float, float]:
     raw = os.getenv(f"PRICE_{tier.upper()}")
-    return tuple(float(x) for x in raw.split(",")) if raw else default
+    price = tuple(float(x) for x in raw.split(",")) if raw else default
+    return price if len(price) == 3 else (*price, price[0] * 0.1)
 
 
 PRICES = {
-    MODELS["fast"]: _price("fast", (1.0, 5.0)),
-    MODELS["balanced"]: _price("balanced", (2.0, 10.0)),
-    MODELS["strong"]: _price("strong", (4.0, 20.0)),
+    MODELS["fast"]: _price("fast", (0.10, 0.50, 0.01)),
+    MODELS["balanced"]: _price("balanced", (2.0, 10.0, 0.10)),
+    MODELS["strong"]: _price("strong", (4.0, 20.0, 0.20)),
 }
+CACHE_WRITE_FACTOR = 1.25  # 5-minute cache
+# Models that charge more for one long prompt: model -> (prompt tokens, price factor).
+LONG_PROMPT = {"claude-haiku-5-5": (100_000, 5)}
 WEB_SEARCH_USD = float(os.getenv("PRICE_WEB_SEARCH", "0.01"))  # per search
 
 
-def estimate_cost(model: str, input_tokens: int, output_tokens: int, web_searches: int = 0) -> float:
-    p_in, p_out = PRICES.get(model, (2.0, 10.0))
-    return round(input_tokens / 1e6 * p_in + output_tokens / 1e6 * p_out + web_searches * WEB_SEARCH_USD, 4)
+def estimate_cost(model: str, usage: dict) -> float:
+    """Cost of ONE API response from its `usage`; long-prompt pricing is decided per request."""
+    p_in, p_out, p_read = PRICES.get(model, (2.0, 10.0, 0.10))
+    fresh = usage.get("input_tokens") or 0
+    read = usage.get("cache_read_input_tokens") or 0
+    written = usage.get("cache_creation_input_tokens") or 0
+    tokens = fresh * p_in + read * p_read + written * p_in * CACHE_WRITE_FACTOR + (usage.get("output_tokens") or 0) * p_out
+    limit, factor = LONG_PROMPT.get(model, (0, 1))
+    if limit and fresh + read + written > limit:
+        tokens *= factor
+    searches = (usage.get("server_tool_use") or {}).get("web_search_requests") or 0
+    return tokens / 1e6 + searches * WEB_SEARCH_USD
 
 
-# The router decides complexity; this table (in code, not in a prompt) turns it
-# into a model per agent and a search budget.
+# The router decides complexity; this table (in code, not in a prompt) turns it into
+# a model per agent, a search budget and a limit on findings (None = as many as needed).
 MODEL_PLAN = {
-    "simple":   {"researcher": "fast",     "analyst": "fast",     "writer": "fast",     "searches": 3},
-    "moderate": {"researcher": "balanced", "analyst": "balanced", "writer": "balanced", "searches": 5},
-    "complex":  {"researcher": "balanced", "analyst": "strong",   "writer": "strong",   "searches": 8},
+    "simple":   {"researcher": "fast",     "analyst": "fast",     "writer": "fast",     "searches": 2, "max_findings": 6},
+    "moderate": {"researcher": "balanced", "analyst": "balanced", "writer": "balanced", "searches": 5, "max_findings": 12},
+    "complex":  {"researcher": "balanced", "analyst": "strong",   "writer": "strong",   "searches": 8, "max_findings": None},
 }
 
 
@@ -67,8 +80,8 @@ class AgentSpec:
         if self.key == "researcher":
             return [T.web_search_tool(searches), T.FETCH_PAGE], {"fetch_page": impls["fetch_page"]}
         if self.key == "analyst":
-            return ([T.web_search_tool(max(2, searches // 2)), T.EVALUATE_SOURCE],
-                    {"evaluate_source": impls["evaluate_source"]})
+            return ([T.web_search_tool(max(1, searches // 2)), T.EVALUATE_SOURCE, T.FIND_IN_SOURCE],
+                    {"evaluate_source": impls["evaluate_source"], "find_in_source": impls["find_in_source"]})
         return [], {}
 
 

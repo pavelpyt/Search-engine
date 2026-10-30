@@ -4,6 +4,7 @@ Security for a public demo:
 - POST /api/session exchanges the access code (in the JSON body, never in a URL)
   for an HttpOnly session cookie.
 - POST /api/jobs takes the question in the body; the SSE URL carries only the job id.
+  A follow-up names its parent job; the context stays on the server, the browser never supplies it.
 - A job's events and trace are readable only by the session that started it.
 - API responses are `Cache-Control: no-store`; logs never contain the code or cookie.
 - Jobs survive a dropped connection: the stream replays from Last-Event-ID.
@@ -57,6 +58,7 @@ class Job:
         self.id = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:8]
         self.owner = owner
         self.question = question
+        self.memory: dict = {}  # what a follow-up to this job inherits
         self.events: list[dict] = []
         self.done = False
         self.cond = asyncio.Condition()
@@ -156,6 +158,7 @@ async def skill_file(name: str):
 
 class JobIn(BaseModel):
     question: str
+    parent_id: str | None = None  # the finished job this question follows up on
 
 
 @app.post("/api/jobs")
@@ -164,6 +167,9 @@ async def create_job(body: JobIn, request: Request):
     question = body.question.strip()[:MAX_QUESTION]
     if len(question) < 3:
         raise HTTPException(422, "Question too short")
+    parent = _own_job(body.parent_id, request) if body.parent_id else None
+    if parent and not parent.done:
+        raise HTTPException(409, "Předchozí běh ještě neskončil.")
     if _rate_limited(_client_ip(request)):
         raise HTTPException(429, "Limit dotazů na hodinu vyčerpán, zkus to později.")
     job = Job(sid, question)
@@ -180,11 +186,12 @@ async def create_job(body: JobIn, request: Request):
 
     async def worker():
         try:
-            await emit({"type": "run_started", "question": question})
+            await emit({"type": "run_started", "question": question, "parent_id": body.parent_id})
             if CONCURRENCY.locked():
                 await emit({"type": "log", "level": "info", "msg": "Čekám ve frontě na volný běh…"})
             async with CONCURRENCY:
-                await Pipeline(make_client(), emit).run(question)
+                pipeline = Pipeline(make_client(), emit, memory=parent.memory if parent else None)
+                job.memory = pipeline.next_memory(await pipeline.run(question))
         except Exception as exc:  # the pipeline reports its own failures; this is a last resort
             await emit({"type": "error", "msg": str(exc)})
         finally:

@@ -35,12 +35,13 @@ def verify_quote(doc: dict | None, quote: str) -> str:
     """exact | normalized | not_found | not_in_fetched_part | not_fetched | no_quote"""
     if not quote or len(quote.strip()) < 8:
         return "no_quote"
-    if not doc or not doc.get("text"):
+    text = (doc or {}).get("full_text") or (doc or {}).get("text")
+    if not text:
         return "not_fetched"
-    if quote.strip() in doc["text"]:
+    if quote.strip() in text:
         return "exact"
     nq = normalize(quote)
-    if nq and nq in normalize(doc["text"]):
+    if nq and nq in normalize(text):
         return "normalized"
     return "not_in_fetched_part" if doc.get("truncated") else "not_found"
 
@@ -63,6 +64,22 @@ def annotate_findings(research: dict, docs: dict) -> list[dict]:
         out.append(f)
     research["findings"] = out
     return out
+
+
+def reuse_findings(research: dict, known: list[dict]) -> None:
+    """Add the earlier findings the Researcher named in `reuse`; the rest of the run treats them as its own."""
+    by_id = {f["id"]: f for f in known}
+    reused = [dict(by_id[str(i)]) for i in research.pop("reuse", None) or [] if str(i) in by_id]
+    research["findings"] = reused + (research.get("findings") or [])
+
+
+def merge_research(previous: dict, update: dict) -> dict:
+    """Merge returned research into the earlier one: same id replaces, new id is added."""
+    findings = {f["id"]: f for f in previous.get("findings") or []}
+    for f in update.get("findings") or []:
+        fid = f.get("id") or f"f{len(findings) + 1}"
+        findings[fid] = {**f, "id": fid}
+    return {**previous, **update, "findings": list(findings.values())}
 
 
 def number_sources(findings: list[dict], extra_urls: list[str], scores: dict) -> list[dict]:
@@ -123,7 +140,8 @@ def build_ledger(findings: list[dict], analysis: dict, sources: list[dict]) -> l
                        "confidence": confidence, "evidence": evidence,
                        "source_ns": sorted({e["source_n"] for e in evidence if e["source_n"]}),
                        "quote_verified": bool(verified), "independent_corroboration": independent,
-                       "limitations": limitations, "analyst_note": fact.get("note", "")})
+                       "limitations": limitations, "analyst_note": fact.get("note", ""),
+                       "temporal_sensitivity": fact.get("temporal_sensitivity")})
     return ledger
 
 

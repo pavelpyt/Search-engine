@@ -9,6 +9,10 @@ from __future__ import annotations
 import re
 
 COMPLEXITY = {"simple", "moderate", "complex"}
+# Honest verdicts: "we have no evidence for this" needs no finding behind it.
+NO_EVIDENCE_NEEDED = {"UNSUPPORTED", "NOT_CHECKED"}
+# Sections without sourced claims: gaps and advice have nothing to cite (plain-writing skill).
+UNCITED_SECTIONS = re.compile(r"(?i)#+\s*(co nevíme|open questions|what we don.t know|co dál|další krok|next steps|what next)")
 
 
 def check_router(r: dict) -> list[str]:
@@ -45,7 +49,8 @@ def check_analysis(a: dict, finding_ids: set[str] | None = None) -> list[str]:
                   {"SUPPORTED", "PARTIALLY_SUPPORTED"}]
     if len(supporting) < 2:
         missing.append(f"at least 2 SUPPORTED/PARTIALLY_SUPPORTED facts (got {len(supporting)})")
-    unlinked = [f.get("id") for f in facts if not f.get("based_on")]
+    unlinked = [f.get("id") for f in facts if not f.get("based_on")
+                and str(f.get("verification_status", "")).upper() not in NO_EVIDENCE_NEEDED]
     if unlinked:
         missing.append(f"facts without based_on finding ids: {unlinked}")
     if finding_ids is not None:
@@ -71,18 +76,27 @@ def check_writer(w: dict) -> list[str]:
     return missing
 
 
+def uncited_paragraphs(markdown: str) -> int:
+    """Longer paragraphs without a citation, outside the sections that have nothing to cite."""
+    parts = re.split(r"(?m)^(#+[ \t].*)$", markdown)
+    count = 0
+    for heading, body in zip([""] + parts[1::2], parts[0::2]):
+        if not UNCITED_SECTIONS.match(heading):
+            count += sum(1 for p in re.split(r"\n\s*\n", body) if len(p.strip()) > 120 and not re.search(r"\[\d+\]", p))
+    return count
+
+
 def quality_report(markdown: str, sources: list[dict]) -> dict:
     """Final output check shown in the UI."""
     cited = sorted({int(n) for n in re.findall(r"\[(\d+)\]", markdown)})
     valid = set(range(1, len(sources) + 1))
     invalid = [n for n in cited if n not in valid]
     unused = [n for n in sorted(valid) if n not in cited]
-    paragraphs = [p for p in re.split(r"\n\s*\n", markdown) if p.strip() and not p.strip().startswith("#")]
-    uncited = sum(1 for p in paragraphs if len(p) > 120 and not re.search(r"\[\d+\]", p))
+    uncited = uncited_paragraphs(markdown)
     checks = [
         {"name": "Every citation points to a listed source (mechanical, not a fact check)", "ok": not invalid,
          "detail": f"invalid: {invalid}" if invalid else f"{len(cited)} sources cited"},
-        {"name": "Longer paragraphs carry a citation", "ok": uncited == 0,
+        {"name": "Longer paragraphs with claims carry a citation", "ok": uncited == 0,
          "detail": f"{uncited} uncited paragraph(s)" if uncited else "all cited"},
         {"name": "Open questions section present", "ok": bool(re.search(r"(?im)^#+\s*(co nevíme|open questions|what we don.t know)", markdown)),
          "detail": ""},

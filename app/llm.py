@@ -17,10 +17,17 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
+from .agents import estimate_cost
+
 API_URL = "https://api.anthropic.com/v1/messages"
 API_VERSION = "2023-06-01"
 RETRY_STATUS = {408, 409, 429, 500, 502, 503, 504, 529}
 MAX_RETRIES = int(os.getenv("API_MAX_RETRIES", "4"))
+# Per-turn output cap; thinking counts against it. A cut-off turn runs once more at MAX_TOKENS_RETRY.
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "16000"))
+MAX_TOKENS_RETRY = int(os.getenv("MAX_TOKENS_RETRY", "32000"))
+# With caching on, `input_tokens` is only the uncached tail: the prompt size is the first three summed.
+USAGE_FIELDS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens", "output_tokens")
 
 Emit = Callable[[dict], Awaitable[None]]
 ClientTool = Callable[[dict], Awaitable[str]]
@@ -41,7 +48,7 @@ class AgentIncompleteError(RuntimeError):
 class AgentResult:
     text: str
     messages: list[dict]
-    usage: dict = field(default_factory=lambda: {"input_tokens": 0, "output_tokens": 0, "web_searches": 0})
+    usage: dict = field(default_factory=dict)
     turns: int = 0
     stop_reason: str | None = None
 
@@ -59,6 +66,9 @@ class MessagesClient:
         body: dict[str, Any] = {"model": model, "max_tokens": max_tokens, "system": system, "messages": messages}
         if tools:
             body["tools"] = tools
+            # Tool loops resend the growing conversation: cache up to the newest block. Calls
+            # without tools are one-shot, a cache write there would never be read back.
+            body["cache_control"] = {"type": "ephemeral"}
         headers = {"x-api-key": self.api_key, "anthropic-version": API_VERSION, "content-type": "application/json"}
         for attempt in range(MAX_RETRIES + 1):
             try:
@@ -140,7 +150,7 @@ async def run_agent(
     client_tools: dict[str, ClientTool],
     emit: Emit,
     max_turns: int = 10,
-    max_tokens: int = 8000,
+    max_tokens: int = MAX_TOKENS,
 ) -> AgentResult:
     """Run one agent: send messages, execute client tools, loop until end_turn.
 
@@ -150,7 +160,7 @@ async def run_agent(
     Pass `messages` to continue an existing conversation (e.g. a JSON repair turn).
     """
     messages = list(messages) if messages else [{"role": "user", "content": user_content}]
-    usage = {"input_tokens": 0, "output_tokens": 0, "web_searches": 0}
+    usage = {**dict.fromkeys(USAGE_FIELDS, 0), "web_searches": 0, "cost_usd": 0.0}
     await emit({"type": "agent_request", "agent": agent, "model": model, "system": system,
                 "tools": tools, "messages": for_display(messages)})
 
@@ -175,14 +185,24 @@ async def run_agent(
                     "stop_reason": resp.get("stop_reason"), "usage": resp.get("usage", {}),
                     "duration_ms": int((time.monotonic() - t0) * 1000)})
         u = resp.get("usage", {})
-        usage["input_tokens"] += u.get("input_tokens", 0)
-        usage["output_tokens"] += u.get("output_tokens", 0)
+        for k in USAGE_FIELDS:
+            usage[k] += u.get(k) or 0
         usage["web_searches"] += (u.get("server_tool_use") or {}).get("web_search_requests", 0)
+        usage["cost_usd"] += estimate_cost(model, u)
         content = resp.get("content", [])
         stop = resp.get("stop_reason")
         messages.append({"role": "assistant", "content": content})
         await emit({"type": "agent_turn", "agent": agent, "turn": turn, "stop_reason": stop,
                     "content": for_display(content), "usage": dict(usage)})
+
+        if stop == "max_tokens" and max_tokens < MAX_TOKENS_RETRY:
+            # Same turn again with more room. The cut-off turn is dropped, not answered:
+            # it may end in an unfinished tool_use that has no tool_result.
+            messages.pop()
+            max_tokens = MAX_TOKENS_RETRY
+            await emit({"type": "log", "level": "warn",
+                        "msg": f"{agent}: turn cut off, running it again with max_tokens={max_tokens}"})
+            continue
 
         texts, client_calls = [], []
         for block in content:
