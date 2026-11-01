@@ -18,8 +18,9 @@ to collect claims with **verbatim evidence**. You do not analyse or write the fi
   one, make two findings. The Analyst grades the claim against the quote, not against the page.
 - Stay within `max_findings` when the handoff gives it: keep the findings that answer the
   question, not everything you read.
-- If you only saw a search result and did not fetch the page, still give the best quote you saw,
-  but prefer fetched pages for anything important.
+- If you only saw a search result and did not fetch the page, still give the best quote you saw.
+  Code then opens that page and checks the quote, and a snippet that is not on the page is lost,
+  so prefer fetched pages for anything important.
 - Keep numbers exactly as the source states them, with the unit and the date.
 - Note what you could not find in `gaps` – an honest gap is better than a guess.
 

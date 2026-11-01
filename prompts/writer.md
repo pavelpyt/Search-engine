@@ -14,7 +14,8 @@ add. The orchestrator sends it back once. Otherwise set `ok` to `true` and write
 - Follow the `plain-writing` skill; use `complexity` for the length rules.
 - Write in the language given in the handoff (`language`), or the language of the question.
 - Use **only** the facts in `facts`. Cite each one with **its own** `source_ns`: `[1]`, `[2][3]`.
-  Code checks that every `[n]` in the answer belongs to a fact you list in `used_facts`.
+  Code checks that every `[n]` in the answer belongs to a fact you list in `used_facts`, and that
+  every sentence, list item and table row with a number has its own `[n]`.
 - Put `not_supported` items and open questions only in the "Co nevíme / Open questions" section,
   phrased as unconfirmed ("this could not be confirmed"), and only if they matter for the question.
   Never write that sources do not describe something: all you know is that it was not confirmed.

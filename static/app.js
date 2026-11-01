@@ -216,7 +216,7 @@ function evidenceHtml(e) {
   if (!e.ledger || !e.ledger.length) return "";
   const facts = e.ledger.map((f) => `<li class="rule"><div class="line"><span class="tag ${VSTATUS_TAG[f.verification_status] || ""}">${esc(VSTATUS_CZ[f.verification_status] || f.verification_status)}</span>
       <b>${esc(f.fact_id)}</b> ${esc(f.statement)}</div>
-      <div class="why">JISTOTA ${esc(String(f.confidence).toUpperCase())}${f.independent_corroboration ? " · nezávisle potvrzeno" : ""}${f.limitations.length ? " · " + esc(f.limitations.join(", ")) : ""}</div>
+      <div class="why">JISTOTA ${esc(String(f.confidence).toUpperCase())}${f.multi_site ? " · 2+ weby B+ (heuristika)" : ""}${f.limitations.length ? " · " + esc(f.limitations.join(", ")) : ""}</div>
       <ul>${f.evidence.map((x) => `<li><span class="tag ${x.quote_verified ? "good" : "warn"}">${x.quote_verified ? "CITÁT OK" : "CITÁT ?"}</span> <span class="note">${esc(x.quote_check)}</span> „${esc(short(x.quote, 220))}“ ${x.source_n ? `<a href="#${srcId(x.source_n)}" class="cite">[${x.source_n}]</a>` : ""}</li>`).join("")}</ul></li>`).join("");
   return `<details class="evidence"><summary>#DŮKAZY · ${e.ledger.length} FAKTŮ</summary>
     <p class="note">CITÁT OK = citát nalezen v textu stažené stránky (neznamená, že je pravdivý). Tier zdroje je jen apriorní odhad podle URL.</p><ul class="checks">${facts}</ul></details>`;
@@ -232,7 +232,7 @@ function statsHtml(e) {
     ${cell(ledger.length, "FAKTŮ")}
     ${cell(`${verifiedQuotes}/${allQuotes}`, "OVĚŘENÉ CITÁTY", verifiedQuotes === allQuotes && allQuotes ? "g" : "w")}
     ${cell(sup ? `${sup.supported}/${sup.of}` : "–", "PODLOŽENO", sup && sup.of && sup.supported === sup.of ? "g" : "w")}
-    ${cell(ev ? ev.independent_corroboration : "–", "NEZÁVISLE")}
+    ${cell(ev ? ev.multi_site : "–", "VÍCE WEBŮ")}
     ${cell((e.sources || []).length, "ZDROJŮ")}
     ${cell(usd(e.cost_usd).replace(" USD", "") || "–", "CENA USD")}</div>`;
 }
@@ -243,7 +243,7 @@ function renderAnswer(e) {
   const md = (e.answer_markdown || "").replace(/\[(\d+)\]/g, (m, n) => `<a class="cite" href="#${srcId(n)}">[${n}]</a>`);
   const html = DOMPurify.sanitize(marked.parse(md), { ADD_ATTR: ["target"] });
   const tierTag = { A: "good", B: "strong", C: "warn", D: "bad" };
-  const sources = (e.sources || []).map((s) => `<li id="${srcId(s.n)}"><span class="n">[${s.n}]</span>${s.tier ? `<span class="tag ${tierTag[s.tier] || ""}" title="apriorní skóre ${s.score ?? "?"}">TIER ${s.tier}</span>` : ""}
+  const sources = (e.sources || []).map((s) => `<li id="${srcId(s.n)}"><span class="n">[${s.n}]</span>${s.tier ? `<span class="tag ${tierTag[s.tier] || ""}" title="skóre ${s.score ?? "?"} (nástroj ${s.tool_score ?? "?"}, úprava Analysta ${s.analyst_adjustment ?? 0})">TIER ${s.tier}</span>` : ""}
       <a href="${esc(safeUrl(s.url))}" target="_blank" rel="noopener noreferrer">${esc(s.title)}</a></li>`).join("");
   const q = e.quality;
   const checks = q ? q.checks.map((c) => `<li class="rule"><div class="line">${okTag(c.ok)} ${esc(c.name)}</div>${c.detail ? `<div class="${c.ok ? "why" : "fix"}">${esc(c.detail)}</div>` : ""}</li>`).join("") : "";

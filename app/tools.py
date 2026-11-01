@@ -201,6 +201,13 @@ def _load_score_module():
 
 _score = _load_score_module()
 
+
+def final_scores(scored: dict, proposals: list | None) -> dict:
+    """Tool results plus the Analyst's proposed changes. A source the tool never scored gets no score."""
+    asked = {p.get("url"): p for p in proposals or [] if isinstance(p, dict)}
+    return {url: _score.adjust(prior, asked.get(url, {}).get("score"), asked.get(url, {}).get("reason"))
+            for url, prior in scored.items()}
+
 MOCK_PAGE = ("[mock page] {url}\nKey facts and figures about the topic, published 2026. "
              "The relevant sentence from the page states the main finding clearly. "
              "A second paragraph adds context and a supporting figure for 2026.")

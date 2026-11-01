@@ -16,6 +16,7 @@ moves data.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -26,13 +27,16 @@ from . import contracts as C
 from . import evidence as E
 from .agents import AGENTS, MODEL_PLAN, MODELS
 from .llm import COMPLETE_STOPS, USAGE_FIELDS, AgentIncompleteError, extract_json, run_agent
-from .tools import RunContext, build_tools
+from .tools import RunContext, build_tools, final_scores
 
 MAX_RETURNS = int(os.getenv("MAX_RETURNS", "1"))
 Emit = Callable[[dict], Awaitable[None]]
 
 # What a follow-up question inherits from the runs before it.
 MEMORY_TURNS, MEMORY_FINDINGS, MEMORY_ANSWER_CHARS, MAX_QUESTION = 3, 40, 1500, 500
+
+# Pages code opens itself when the Researcher quoted a search result without reading it.
+MAX_QUOTE_FETCHES = 10
 
 COMPLETED, PARTIAL, INSUFFICIENT, FAILED = "COMPLETED", "PARTIAL", "INSUFFICIENT_EVIDENCE", "FAILED"
 
@@ -73,6 +77,21 @@ class Pipeline:
         urls = {f["source_url"] for f in findings}
         return {"turns": turns[-MEMORY_TURNS:], "findings": findings,
                 "docs": {u: d for u, d in self.ctx.docs.items() if u in urls}}
+
+    # ---- quotes taken from search results -------------------------------
+    async def read_quoted_pages(self, research: dict) -> list[dict]:
+        """Open the pages behind unread quotes, so each one gets a real yes or no instead of 'not fetched'."""
+        findings = self.findings = E.annotate_findings(research, self.ctx.docs)
+        unread = list(dict.fromkeys(f["source_url"] for f in findings
+                                    if f["quote_check"] == "not_fetched" and f.get("source_url")))
+        if unread:
+            await asyncio.gather(*(self.impls["fetch_page"]({"url": u}) for u in unread[:MAX_QUOTE_FETCHES]),
+                                 return_exceptions=True)
+            findings = self.findings = E.annotate_findings(research, self.ctx.docs)
+            await self.emit({"type": "log", "level": "info", "msg": f"Opened {len(unread[:MAX_QUOTE_FETCHES])} of "
+                             f"{len(unread)} pages quoted but not read; "
+                             f"still unread: {sum(f['quote_check'] == 'not_fetched' for f in findings)} quotes"})
+        return findings
 
     # ---- evidence found by the Analyst ---------------------------------
     async def add_evidence(self, research: dict, analysis: dict):
@@ -174,7 +193,7 @@ class Pipeline:
         r = await self.call("router", "fast", content)
         missing = C.check_router(r)
         if missing:  # router is cheap: fall back to safe defaults instead of failing
-            r.setdefault("subquestions", [question])
+            r["subquestions"] = C.usable_subquestions(r) or [question]
             if r.get("complexity") not in C.COMPLEXITY:
                 r["complexity"] = "moderate"
             await self.emit({"type": "log", "level": "warn", "msg": f"Router output fixed: {missing}"})
@@ -214,7 +233,7 @@ class Pipeline:
         E.reuse_findings(r, known)
         if previous:
             r = E.merge_research(previous, r)
-        findings = self.findings = E.annotate_findings(r, self.ctx.docs)
+        findings = await self.read_quoted_pages(r)
         verified = sum(1 for f in findings if f["quote_verified"])
         await self.status("researcher", "done", f"{len(findings)} zjištění, {verified} citátů ověřeno v textu")
         return r
@@ -335,10 +354,14 @@ class Pipeline:
             missing = C.check_analysis(analysis, {f["id"] for f in findings})
             if analysis.get("_not_scored"):
                 missing.append(f"evaluate_source not called for: {analysis['_not_scored']}")
-            scores = {**self.ctx.scored, **{s.get("url"): s for s in analysis.get("source_scores", []) if s.get("url")}}
+            scores = final_scores(self.ctx.scored, analysis.get("source_scores"))
+            capped = [s["url"] for s in scores.values() if s["capped"]]
+            if capped:
+                await self.emit({"type": "log", "level": "warn", "msg": f"Analyst score change capped at ±15 or missing a reason: {capped}"})
             sources = E.number_sources(findings, [], scores)
             ledger = E.build_ledger(findings, analysis, sources)
             supported = [f for f in ledger if f["verification_status"] in E.SUPPORTING]
+            missing += C.check_ledger(supported)
             await self.handoff("analyst", "writer", {"facts": ledger, "outline": analysis.get("outline"),
                                                      "sources": sources}, missing)
             if missing and w_returns < MAX_RETURNS:

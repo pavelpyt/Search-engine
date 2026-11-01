@@ -3,7 +3,8 @@
 Part of the `source-evaluation` skill. The analysis agent calls it through the
 `evaluate_source` tool, then adjusts the result with its own judgement as the
 SKILL.md rubric describes. Keeping the base score in code makes it repeatable:
-the same URL always starts from the same number.
+the same URL always starts from the same number. The agent only proposes its
+adjustment: `adjust` decides what counts, so the limit below cannot be talked around.
 
 Usage: python score_source.py <url> [page_age] [timeless|slow-changing|time-sensitive]
 """
@@ -40,6 +41,7 @@ RULES: list[tuple[str, int, re.Pattern]] = [
 ]
 
 TIERS = [(80, "A"), (65, "B"), (45, "C"), (0, "D")]
+MAX_ADJUSTMENT = 15  # tier B is 15 wide, so this also keeps judgement within one tier
 # Years after which a source counts as old, by how fast its claims go out of date.
 OLD_AFTER = {"timeless": None, "slow-changing": 10, "time-sensitive": 4}
 
@@ -49,6 +51,20 @@ def _year(page_age: str | None) -> int | None:
         return None
     m = re.search(r"(19|20)\d{2}", page_age)
     return int(m.group(0)) if m else None
+
+
+def tier_of(s: int) -> str:
+    return next(t for limit, t in TIERS if s >= limit)
+
+
+def adjust(prior: dict, proposed, reason: str = "") -> dict:
+    """The final score: the prior plus the agent's adjustment, capped. No reason, no adjustment."""
+    is_number = isinstance(proposed, (int, float)) and not isinstance(proposed, bool)
+    asked = round(proposed - prior["score"]) if is_number and str(reason or "").strip() else 0
+    delta = max(-MAX_ADJUSTMENT, min(MAX_ADJUSTMENT, asked))
+    s = max(0, min(100, prior["score"] + delta))
+    return {**prior, "tool_score": prior["score"], "analyst_adjustment": delta, "capped": delta != asked,
+            "score": s, "tier": tier_of(s), "reason": reason or ""}
 
 
 def score(url: str, page_age: str | None = None, temporal_sensitivity: str = "time-sensitive") -> dict:
@@ -84,9 +100,8 @@ def score(url: str, page_age: str | None = None, temporal_sensitivity: str = "ti
         signals.append("publication date unknown")
 
     s = max(0, min(100, s))
-    tier = next(t for limit, t in TIERS if s >= limit)
     return {"url": url, "host": host, "source_type": source_type,
-            "score": s, "tier": tier, "signals": signals, "temporal_sensitivity": temporal_sensitivity}
+            "score": s, "tier": tier_of(s), "signals": signals, "temporal_sensitivity": temporal_sensitivity}
 
 
 if __name__ == "__main__":

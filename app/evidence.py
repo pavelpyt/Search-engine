@@ -4,12 +4,18 @@ Three separate things, never mixed:
 - source quality  : prior score of the source (source-evaluation skill),
 - claim support   : does a verbatim quote from the fetched page back the claim
                     (the Analyst grades it, code checks the quote really exists),
-- corroboration   : are there really independent sources (different sites,
-                    different wording), not two copies of one press release.
+- corroboration   : do different B+ sites back it in different words. A heuristic:
+                    code cannot see a rewritten press release, so the Analyst can
+                    veto it (`same_origin`) but never grant it.
 
 `quote_verified` only means the quote was found in the text we downloaded.
 It does not prove the quote is true, and a missing quote in a truncated page
-does not prove the quote is absent from the full page.
+does not prove the quote is absent from the full page. Whether the quote means
+what the claim says stays the Analyst's judgement (`verification_status`).
+
+What code guarantees: a fact counts as supporting only with a verified quote, and
+only verified quotes give it citable sources. Tiers and scores come from
+`evaluate_source` and the skill's cap, never directly from a model.
 """
 from __future__ import annotations
 
@@ -90,7 +96,8 @@ def number_sources(findings: list[dict], extra_urls: list[str], scores: dict) ->
             seen[url] = len(out) + 1
             sc = scores.get(url, {})
             out.append({"n": seen[url], "id": f"src{seen[url]}", "url": url, "title": f.get("source_title") or url,
-                        "tier": sc.get("tier"), "score": sc.get("score")})
+                        "tier": sc.get("tier"), "score": sc.get("score"), "tool_score": sc.get("tool_score"),
+                        "analyst_adjustment": sc.get("analyst_adjustment")})
     for url in extra_urls:
         if url and url not in seen and str(url).startswith("http"):
             seen[url] = len(out) + 1
@@ -104,6 +111,7 @@ def build_ledger(findings: list[dict], analysis: dict, sources: list[dict]) -> l
     """Join the Analyst's graded facts with the findings (quotes) and numbered sources."""
     by_id = {f["id"]: f for f in findings}
     n_of = {s["url"]: s["n"] for s in sources}
+    tier_of = {s["url"]: s.get("tier") for s in sources}
     ledger = []
     for i, fact in enumerate(analysis.get("verified_facts") or [], 1):
         fid = fact.get("id") or f"F{i}"
@@ -120,8 +128,10 @@ def build_ledger(findings: list[dict], analysis: dict, sources: list[dict]) -> l
             status = "NOT_CHECKED"
         verified = [e for e in evidence if e["quote_verified"]]
         sites = {site_of(e["url"]) for e in verified if e["url"]}
-        quotes = {normalize(e["quote"]) for e in verified}
-        independent = len(sites) >= 2 and len(quotes) >= 2
+        good = [e for e in verified if e["url"] and tier_of.get(e["url"]) in {"A", "B"}]
+        multi_site = (len({site_of(e["url"]) for e in good}) >= 2 and len({normalize(e["quote"]) for e in good}) >= 2
+                      and not fact.get("same_origin"))
+        primary = bool(fact.get("primary")) and any(tier_of.get(e["url"]) == "A" for e in verified)
         limitations = []
         if not evidence:
             limitations.append("not linked to any finding")
@@ -130,16 +140,16 @@ def build_ledger(findings: list[dict], analysis: dict, sources: list[dict]) -> l
         if len(sites) < 2:
             limitations.append("single site")
         confidence = str(fact.get("confidence", "low")).lower()
-        if confidence == "high" and not (verified and (independent or fact.get("primary"))):
-            confidence = "medium"   # high needs a verified quote and independence (or a primary source)
+        if confidence == "high" and not (multi_site or primary):
+            confidence = "medium"   # high needs two B+ sites or a primary source on tier A
         if not verified and confidence != "low":
             confidence = "low"
-        if status in SUPPORTING and not evidence:
-            status = "NOT_CHECKED"
+        if status in SUPPORTING and not verified:
+            status = "NOT_CHECKED"  # the model's verdict needs a quote code found
         ledger.append({"fact_id": fid, "statement": fact.get("fact", ""), "verification_status": status,
                        "confidence": confidence, "evidence": evidence,
-                       "source_ns": sorted({e["source_n"] for e in evidence if e["source_n"]}),
-                       "quote_verified": bool(verified), "independent_corroboration": independent,
+                       "source_ns": sorted({e["source_n"] for e in verified or evidence if e["source_n"]}),
+                       "quote_verified": bool(verified), "multi_site": multi_site,
                        "limitations": limitations, "analyst_note": fact.get("note", ""),
                        "temporal_sensitivity": fact.get("temporal_sensitivity")})
     return ledger
@@ -161,6 +171,6 @@ def check_writer_evidence(writer: dict, ledger: list[dict], markdown: str) -> di
         "citations_not_backed_by_used_facts": not_backed,
         "evidence_support": {"supported": len(supported), "of": len(used_ok)},
         "unsupported_in_ledger": sum(1 for f in ledger if f["verification_status"] not in SUPPORTING),
-        "independent_corroboration": sum(1 for f in used_ok if f["independent_corroboration"]),
+        "multi_site": sum(1 for f in used_ok if f["multi_site"]),
         "ok": bool(used_ok) and not unknown and not unsupported_used and not not_backed,
     }

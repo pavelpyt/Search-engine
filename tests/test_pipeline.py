@@ -679,7 +679,184 @@ def test_T10_same_site_or_same_quote_is_not_independent():
                                                               "verification_status": "SUPPORTED"}]}, src)
     same_quote = E.build_ledger(findings, {"verified_facts": [{"id": "F1", "fact": "x", "based_on": ["f1", "f3"],
                                                                "verification_status": "SUPPORTED"}]}, src)
-    assert not same_site[0]["independent_corroboration"] and not same_quote[0]["independent_corroboration"]
+    assert not same_site[0]["multi_site"] and not same_quote[0]["multi_site"]
+
+
+# ---------------------------------------------------------------- review: what COMPLETED may rest on
+def graded(status="SUPPORTED", confidence="high", tiers=("A", "A"), found=(True, True), **fact):
+    """A fact on two findings from two sites; `found` says whether each quote is on its page."""
+    urls = ["https://a.org/1", "https://b.org/2"]
+    quotes = ["13.5 % of EU enterprises used AI", "In 2024, 13.5 % of EU enterprises"]
+    findings = [{"id": f"f{i}", "source_url": u, "quote": q if ok else "a sentence that is not on the page"}
+                for i, (u, q, ok) in enumerate(zip(urls, quotes, found), 1)]
+    E.annotate_findings({"findings": findings}, dict.fromkeys(urls, DOC))
+    scores = {u: {"tier": t, "score": 90} for u, t in zip(urls, tiers)}
+    sources = E.number_sources(findings, [], scores)
+    return E.build_ledger(findings, {"verified_facts": [{"id": "F1", "fact": "x", "based_on": ["f1", "f2"],
+                                                         "verification_status": status, "confidence": confidence, **fact}]},
+                          sources)[0]
+
+
+@pytest.mark.parametrize("status", ["SUPPORTED", "PARTIALLY_SUPPORTED"])
+def test_a_verdict_without_a_verified_quote_supports_nothing(status):
+    fact = graded(status, found=(False, False))
+    assert fact["verification_status"] == "NOT_CHECKED" and fact["confidence"] == "low"
+    ev = E.check_writer_evidence({"used_facts": ["F1"]}, [fact], "text [1]")
+    assert ev["unsupported_facts_used"] == ["F1"] and not ev["ok"]
+
+
+def test_only_verified_quotes_give_a_fact_citable_sources():
+    fact = graded(found=(True, False))
+    assert fact["verification_status"] == "SUPPORTED" and fact["source_ns"] == [1]
+    assert E.check_writer_evidence({"used_facts": ["F1"]}, [fact], "text [2]")["citations_not_backed_by_used_facts"] == [2]
+
+
+def test_unverified_analysis_never_reaches_completed():
+    """Every quote is fabricated, the Analyst declares everything SUPPORTED, the Writer cites it all."""
+    url = "https://www.oecd.org/en/topics/artificial-intelligence.html"
+    fake = text_resp({"findings": [{"id": f"f{i}", "claim": "c", "source_url": u, "source_title": "t",
+                                    "quote": f"this sentence {i} does not appear on the page"}
+                                   for i, u in enumerate([url, "https://www.reuters.com/technology/ai-adoption-europe-2026/", url], 1)],
+                      "gaps": []})
+    client = Scripted(router=[ROUTER], researcher=[fake, fake])
+
+    async def go():
+        events, emit = collect()
+        return await Pipeline(client, emit).run("What is the state of this topic today?"), events
+    result, events = run(go())
+    assert result["status"] != "COMPLETED"
+    assert not any(f["verification_status"] in E.SUPPORTING for f in result["ledger"])
+
+
+def test_quotes_from_search_results_are_checked_on_the_real_page():
+    calls = []
+
+    async def go():
+        events, emit = collect()
+        p = Pipeline(Scripted(), emit)
+        fetch = p.impls["fetch_page"]
+
+        async def counted(args):
+            calls.append(args["url"])
+            if "broken" in args["url"]:
+                raise RuntimeError("network down")
+            return await fetch(args)
+        p.impls["fetch_page"] = counted
+        research = {"findings": [
+            {"id": "f1", "source_url": "https://a.org/1", "quote": "The relevant sentence from the page states the main finding clearly."},
+            {"id": "f2", "source_url": "https://a.org/1", "quote": "this snippet is not on the page at all"},
+            {"id": "f3", "source_url": "https://broken.org/2", "quote": "nobody could open this page"}]}
+        return await p.read_quoted_pages(research), events
+    findings, events = run(go())
+    assert calls == ["https://a.org/1", "https://broken.org/2"]  # one fetch per page, a failure stops nothing
+    assert [f["quote_check"] for f in findings] == ["exact", "not_found", "not_fetched"]
+    assert any("Opened 2 of 2" in e.get("msg", "") for e in events)
+
+
+def test_page_opening_is_capped(monkeypatch):
+    monkeypatch.setattr(O, "MAX_QUOTE_FETCHES", 2)
+    calls = []
+
+    async def go():
+        p = Pipeline(Scripted(), collect()[1])
+
+        async def counted(args):
+            calls.append(args["url"])
+        p.impls["fetch_page"] = counted
+        await p.read_quoted_pages({"findings": [{"id": f"f{i}", "source_url": f"https://a.org/{i}", "quote": "a long enough quote"}
+                                                for i in range(5)]})
+    run(go())
+    assert len(calls) == 2
+
+
+def test_high_needs_a_real_primary_or_two_good_sites():
+    assert graded(tiers=("A", "A"))["confidence"] == "high" and graded(tiers=("A", "A"))["multi_site"]
+    assert graded(tiers=("C", "C"))["confidence"] == "medium"                # two sites, both weak
+    assert graded(tiers=("C", "C"), primary=True)["confidence"] == "medium"  # the model's word alone
+    assert graded(tiers=("A", "C"), primary=True)["confidence"] == "high"
+    assert graded(tiers=("B", "B"), same_origin=True)["confidence"] == "medium"
+    assert not graded(tiers=("B", "B"), same_origin=True)["multi_site"]
+
+
+URL = "https://example.com/x"
+
+
+def test_the_model_cannot_overwrite_the_tool_score():
+    prior = {URL: _score.score(URL)}
+    assert prior[URL]["score"] == 50
+    final = T.final_scores(prior, [{"url": URL, "score": 95, "tier": "A", "reason": "looks great"}])[URL]
+    assert (final["tool_score"], final["analyst_adjustment"], final["score"], final["tier"], final["capped"]) == (50, 15, 65, "B", True)
+    assert prior[URL]["score"] == 50
+
+
+@pytest.mark.parametrize("proposal,score", [
+    ({"url": URL, "score": 60, "reason": "research institute"}, 60),
+    ({"url": URL, "score": 95}, 50),                                     # no reason, no change
+    ({"url": URL, "score": "95", "reason": "x"}, 50),                    # not a number
+    ({"url": URL, "score": True, "reason": "x"}, 50),
+    ({"url": "https://other.org", "score": 95, "reason": "x"}, 50),      # another URL changes nothing here
+])
+def test_score_proposals_are_only_proposals(proposal, score):
+    assert T.final_scores({URL: _score.score(URL)}, [proposal])[URL]["score"] == score
+
+
+def test_an_unscored_source_gets_no_score_from_the_model():
+    assert T.final_scores({}, [{"url": URL, "score": 95, "reason": "trust me"}]) == {}
+
+
+def test_judgement_never_moves_a_source_two_tiers():
+    for prior in range(0, 101):
+        base = {"score": prior, "tier": _score.tier_of(prior)}
+        for target in (0, 100):
+            final = _score.adjust(base, target, "reason")
+            assert abs("ABCD".index(final["tier"]) - "ABCD".index(base["tier"])) <= 1
+
+
+def test_the_pipeline_uses_the_capped_score():
+    result = run(Pipeline(Scripted(), collect()[1]).run("What is the state of this topic today?"))
+    wiki = next(s for s in result["sources"] if "wikipedia" in s["url"])
+    assert wiki["score"] == wiki["tool_score"] + wiki["analyst_adjustment"]
+
+
+@pytest.mark.parametrize("bad", [[], "not a list", None, ["  "], [1, 2]])
+def test_router_repair_really_repairs(bad):
+    router = text_resp({"complexity": "simple", "goal": "g", "subquestions": bad})
+    route = run(Pipeline(Scripted(router=[router]), collect()[1]).route("Question?"))
+    assert route["subquestions"] == ["Question?"] and C.check_router(route) == []
+
+
+def test_router_repair_keeps_what_is_usable():
+    router = text_resp({"complexity": "simple", "goal": "g", "subquestions": [f"q{i}" for i in range(9)] + [3]})
+    route = run(Pipeline(Scripted(router=[router]), collect()[1]).route("Question?"))
+    assert route["subquestions"] == [f"q{i}" for i in range(6)]
+
+
+@pytest.mark.parametrize("text", [
+    "Podle výzkumu se produktivita zvýšila o 85 %.",
+    "## Data\n\n- Podíl byl 12,5 %.",
+    "| Rok | Podíl |\n|---|---|\n| 2025 | 12 % |",
+    "První věta má číslo 40 %. Druhá má citaci [1].",
+    "## Co nevíme\n\n- x\n\n## Závěr\n\nCena je 300 000 Kč.",
+])
+def test_a_figure_without_its_own_citation_is_caught(text):
+    assert C.uncited_figures(text)
+    assert not C.quality_report(text, [{"n": 1}])["passed"]
+
+
+@pytest.mark.parametrize("text", [
+    "Podíl byl 12,5 % [1].",
+    "Stálo to 5 mil. Kč a o rok později 7 mld. Kč [1].",
+    "Např. Eurostat uvádí 40 % [2].",
+    "| Rok | Podíl |\n|---|---|\n| 2025 | 12 % [1] |",
+    "V roce 2024 se trh změnil a během let 2020–2025 rostl.",
+    "Emise CO2 a chladivo R32 jsou zmíněné bez čísel.",
+    "1. Ověřte zdroj\n2. Spočítejte návratnost",
+    "## Co nevíme\n\n- Podíl za 2026 může být 40 %.\n\n## Co dál\n\n- Počkejte 3 měsíce.",
+    "Platí od 1. 1. do 31. 12. 2026 [1].",
+    "Viz https://example.com/a/123 pro detaily.",
+])
+def test_figures_that_need_no_new_citation_pass(text):
+    assert C.uncited_figures(text) == []
 
 
 def test_T11_one_good_source_gives_partial_not_completed(monkeypatch):

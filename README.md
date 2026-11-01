@@ -85,10 +85,21 @@ continue_partial | abort`), v UI v záložce **#VALIDACE**.
 
 | Stav | Kdy |
 |---|---|
-| `COMPLETED` | všechny handoffy prošly, Writer cituje jen fakta z ledgeru, kontrola výstupu prošla |
+| `COMPLETED` | všechny handoffy prošly a platí níže uvedené invarianty |
 | `PARTIAL` | odpověď existuje, ale něco neprošlo: kontrakt po vyčerpání vrácení, selhané vrácení nebo závěrečná kontrola; v UI jsou vypsané důvody |
 | `INSUFFICIENT_EVIDENCE` | žádné podložené zjištění/fakt: běh se zastaví, Writer se nevolá, odpověď poctivě řekne, co chybí |
 | `FAILED` | technická chyba (API, nedokončený tah, refusal); odlišené od nedostatku důkazů |
+
+`COMPLETED` v kódu znamená, že platí všechno z tohoto seznamu:
+
+1. Každý fakt, který Writer použil, má stav `SUPPORTED` nebo `PARTIALLY_SUPPORTED` a aspoň jeden citát, který kód našel ve stažené stránce.
+2. Každé `[n]` patří zdroji s takovým ověřeným citátem u některého použitého faktu.
+3. Každá věta, odrážka a řádek tabulky s číslem má vlastní `[n]`, kromě sekcí „Co nevíme“ a „Co dál“.
+4. Tier a skóre zdroje spočítal kód z výsledku nástroje a omezené úpravy Analysta.
+
+`COMPLETED` nezaručuje, že citát významově podporuje tvrzení: to je úsudek Analysta. `PARTIALLY_SUPPORTED`
+stačí, protože Analyst musí tvrzení zúžit tak, aby ho citát pokryl celé. Ani bod 3 neváže větu ke konkrétnímu
+faktu, kontroluje jen přítomnost citace.
 
 `max_tokens`, `refusal`, neznámý `stop_reason` ani vyčerpané `max_turns` se nikdy neberou jako hotový
 výstup. Tah uříznutý na `max_tokens` (`MAX_TOKENS`, do limitu se počítá i thinking) se zahodí a spustí
@@ -124,16 +135,20 @@ prázdné `based_on`, ve finální odpovědi je nelze použít jako ověřený f
 ### Evidence ledger (`app/evidence.py`)
 
 Tři úrovně, které se nemíchají: **kvalita zdroje** (prior ze skillu), **podpora tvrzení** (citát podporuje
-tvrzení) a **nezávislé potvrzení** (různé weby, různé znění, ne dvě kopie jedné tiskové zprávy).
+tvrzení) a **potvrzení více weby** (dva weby tieru B+ s různými citáty). Poslední je heuristika: přepsanou
+tiskovou zprávu kód nepozná, proto ji Analyst může vetovat (`same_origin`), ale potvrzení přidat nemůže.
 
 1. Researcher u každého zjištění (`f1…`) dodá doslovný citát; model vidí z každé stránky 6000 znaků, server
    drží až 200 000 znaků pro kontrolu citátů a `find_in_source`.
 2. Kód hledá citát v textu (`exact | normalized | not_found | not_in_fetched_part | not_fetched`).
    `quote_verified` znamená jen „citát je v textu, který jsme stáhli“, ne že je pravdivý.
+   Když Researcher cituje jen výsledek vyhledávání, kód stránku otevře sám (nejvýš 10, bez tokenů), takže
+   citát dostane skutečnou odpověď místo `not_fetched`.
 3. Analyst vytvoří fakta (`F1…`) s `based_on` odkazy na zjištění a `verification_status`
    (`SUPPORTED | PARTIALLY_SUPPORTED | CONTRADICTED | UNSUPPORTED | NOT_CHECKED`).
-4. Kód z toho sestaví ledger: bez ověřeného citátu jistota max. `low`, `high` jen s ověřeným citátem
-   a nezávislostí (nebo primárním zdrojem); nezávislost počítá kód z různých webů a různých citátů.
+4. Kód z toho sestaví ledger. Fakt bez ověřeného citátu přejde na `NOT_CHECKED` s jistotou `low`, ať
+   Analyst napsal cokoli, a citovat lze jen zdroje s ověřeným citátem. `high` vyžaduje dva weby B+ nebo
+   primární zdroj, který musí mít tier A. Slovo modelu `primary` samo nestačí.
 5. Writer dostane jen podložená fakta, vrací `used_facts` a kód kontroluje, že každé `[n]` v odpovědi
    patří k použitému faktu. V UI panel **#DŮKAZY** ukazuje fakta, citáty a stav CITÁT OK / CITÁT ?.
 
@@ -145,9 +160,10 @@ vystavený jako nástroj, takže skill se opravdu volá, ne jen „čte“.
 
 - **`source-evaluation`** (Analyst): dvoufázové hodnocení. Nejdřív skript `scripts/score_source.py`
   (přes tool `evaluate_source`) dá deterministické skóre 0–100 a tier A–D podle typu domény, https a stáří.
-  Stáří zdroje se počítá podle `temporal_sensitivity` tvrzení. Agent smí skóre upravit nejvýš o ±15 s odůvodněním.
+  Stáří zdroje se počítá podle `temporal_sensitivity` tvrzení. Agent skóre jen navrhuje: `adjust` ve skriptu
+  uplatní změnu nejvýš ±15, bez odůvodnění žádnou, a tier spočítá sám, takže úsudek posune zdroj nejvýš o jeden tier.
   Pak podle pravidel přidělí každému faktu jistotu (`high` jen s jedním primárním A zdrojem nebo dvěma
-  nezávislými B+). Tier se zobrazuje u zdrojů v odpovědi.
+  weby B+). Tier se zobrazuje u zdrojů v odpovědi, skóre nástroje i úprava jsou v popisku.
 - **`plain-writing`** (Writer): odpověď nejdřív, krátké věty, čísla s jednotkou a datem, citace u každého
   faktu včetně tabulek, oddělení faktů od odhadů, povinná sekce „Co nevíme“, zakázané vatové fráze, délka a míra
   nejistot podle náročnosti.
@@ -209,8 +225,8 @@ Nasazení je v příloze na konci.
 
 ## Co je a není ověřené
 
-- 74 offline testů včetně scénářů z review (stavy, `max_tokens`, paralelní tool_use, citace vs. podpora,
-  nezávislost, SSRF a rebinding, session a replay, snímky requestů, nevykonaný skill, přihlášení, doplňující otázky).
+- 111 offline testů včetně scénářů z review (stavy, `max_tokens`, paralelní tool_use, citace vs. podpora,
+  pokrytí evidence, strop skóre, oprava Routeru, SSRF a rebinding, session a replay, snímky requestů, nevykonaný skill, přihlášení, doplňující otázky).
 - Mock režim projde UI end-to-end (session → job → SSE → odpověď s důkazy).
 - **Živé běhy proti Claude API** (30. 10. 2026, cena je odhad z `usage`):
 
@@ -223,8 +239,23 @@ Nasazení je v příloze na konci.
 
   Běhy šly přes lokální UI nebo přímo přes `Pipeline`. Běh `complex` předchází kalibraci podle složitosti.
   Stejná pipeline běžela i na produkčním serveru (Python 3.11, `COMPLETED`, 42 s, 0,03 USD).
-- Hranice: prior skóre zdroje je heuristika z URL; `quote_verified` neověřuje pravdivost; ochrana proti
-  prompt injection je instrukční, ne garantovaná.
+  **Tyto běhy předcházejí přísnější evidenci z 1. 11.** Zpětné přehrání logů ukázalo, že dřív `COMPLETED`
+  připouštělo fakta bez ověřeného citátu (u motoru 1 z 12, u dotazu na AI ve firmách 5 z 14), a to je opravené.
+- **Živé běhy po zpřísnění** (1. 11. 2026):
+
+  | Scénář | Dotaz | Stav | Čas | Cena |
+  |---|---|---|---|---|
+  | Úspěšný dotaz | Minimální mzda 2026 a nárůst proti 2025 | `COMPLETED`, 8 z 8 faktů s ověřeným citátem | 68 s | 0,26 USD |
+  | Nedostatek důkazů | Počet členů smyšleného spolku pěstitelů lanýžů | `PARTIAL`: nic si nevymyslel, řekl, že spolek ani počet nepotvrdil; odstavec bez citace | 58 s | 0,27 USD |
+
+  Druhý běh neskončil `INSUFFICIENT_EVIDENCE`, protože prošla související fakta o lanýžích; ten stav nastane,
+  jen když neprojde žádný fakt. Skutečné vrácení práce je v logu běhu o školství: Analyst vrátil Researcherovi
+  nedoložený nedostatek učitelů. Vrácení podle zadání nelze vynutit, záleží na tom, co model najde.
+- Zpětné přehrání bez tokenů: z 38 neověřených citátů ze starých logů kód po otevření stránek potvrdil 23,
+  u 3 ukázal, že na stránce nejsou, a 12 se nepodařilo otevřít.
+- Hranice: prior skóre zdroje je heuristika z URL; `quote_verified` neověřuje pravdivost ani význam; „více webů“
+  není důkaz nezávislosti; ochrana proti prompt injection je instrukční, ne garantovaná; mock ověřuje průchod
+  pipeline, ne kvalitu výzkumu; a nemám evaly, které by dokládaly, že čtyři agenti odpovídají lépe než jeden.
 
 ## Jak jsem pracoval s AI
 

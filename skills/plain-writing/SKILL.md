@@ -1,7 +1,7 @@
 ---
 name: plain-writing
 description: Write a research answer for a busy reader – answer first, short and concrete, every claim cited, facts kept apart from estimates, and an honest list of what we don't know. Use for the final user-facing answer.
-version: "1.2"
+version: "1.3"
 ---
 
 # Plain writing
@@ -39,6 +39,8 @@ with it. Write so they can stop after the first section and still act correctly.
 - Every factual sentence ends with a citation `[n]` from the numbered source list.
 - Several sources: `[1][3]`. Never cite a number that is not in the list.
 - Tables are claims too: every row that states a figure carries its own `[n]`, in the row itself.
+- Every sentence with a number carries its own `[n]`, whole-year mentions aside. A figure you compute
+  (a difference, a share) cites the sources of its inputs and says it is computed.
 - Confidence from the Analyst shows in the wording:
   - `high`, or a `timeless` fact at `medium` → state it plainly.
   - `medium` → "according to [n]" / "podle [n]".
